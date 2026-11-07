@@ -1,0 +1,24 @@
+// Signing.xcconfig
+// Default signing configuration for AudioBooth
+//
+// Maintainer: These defaults are used automatically.
+// Contributors: Copy Local.xcconfig.example to Local.xcconfig and update
+//               with your settings.
+
+DEVELOPMENT_TEAM = 7MM2M9KD2W
+ORG_IDENTIFIER = me.jgrenier
+
+// The companion server a fresh install starts with. Empty: the app asks nobody until an address is
+// typed into Settings. Set these in Local.xcconfig for builds you only install yourself; see
+// docs/SELF-HOSTING.md. An xcconfig treats // as a comment, so leave the scheme off: a bare hostname
+// becomes https, an IP or host:port becomes http.
+COMPANION_DAEMON_URL =
+COMPANION_WORKER_URL =
+
+// Pull in local overrides if they exist (the ? makes the include optional)
+#include? "Local.xcconfig"
+
+// Feature flags for the app's Swift code (SPM packages never see this variable).
+// SPEAKER_STACK = the personal build's WiiM/Home Assistant stack. The App Store build
+// clears it from the command line:  xcodebuild ... AUDIOBOOTH_FEATURES=""
+AUDIOBOOTH_FEATURES = SPEAKER_STACK

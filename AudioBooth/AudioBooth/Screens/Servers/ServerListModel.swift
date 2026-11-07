@@ -1,0 +1,48 @@
+import API
+import Foundation
+import Logging
+import SwiftUI
+
+final class ServerListModel: ServerListPage.Model {
+  private let audiobookshelf = Audiobookshelf.shared
+
+  init(pendingExportConnection: DeepLinkManager.ExportConnection? = nil) {
+    let allServers = audiobookshelf.authentication.servers.values
+      .sorted { lhs, rhs in
+        let lhsName = lhs.alias ?? (lhs.baseURL.host ?? "Unknown Server")
+        let rhsName = rhs.alias ?? (rhs.baseURL.host ?? "Unknown Server")
+        return lhsName.localizedCaseInsensitiveCompare(rhsName) == .orderedAscending
+      }
+
+    let activeServerID = audiobookshelf.authentication.server?.id
+
+    let serverModels = allServers.map { server in
+      ServerViewModel(server: server)
+    }
+
+    var selected: ServerView.Model?
+    if let exportConnection = pendingExportConnection {
+      selected = ServerViewModel(exportConnection: exportConnection)
+    }
+
+    super.init(
+      servers: serverModels,
+      activeServerID: activeServerID,
+      addServerModel: ServerViewModel(),
+      selected: selected
+    )
+  }
+
+  override func onAppear() {
+    let allServers = audiobookshelf.authentication.servers.values
+      .sorted { lhs, rhs in
+        let lhsName = lhs.alias ?? (lhs.baseURL.host ?? "Unknown Server")
+        let rhsName = rhs.alias ?? (rhs.baseURL.host ?? "Unknown Server")
+        return lhsName.localizedCaseInsensitiveCompare(rhsName) == .orderedAscending
+      }
+    servers = allServers.map { server in
+      ServerViewModel(server: server)
+    }
+    activeServerID = audiobookshelf.authentication.server?.id
+  }
+}

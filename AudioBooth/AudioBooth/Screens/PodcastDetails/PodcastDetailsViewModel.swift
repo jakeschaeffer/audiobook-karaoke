@@ -1,0 +1,398 @@
+import API
+import Combine
+import Foundation
+import Logging
+import Models
+
+final class PodcastDetailsViewModel: PodcastDetailsView.Model {
+  private var podcastsService: PodcastsService { Audiobookshelf.shared.podcasts }
+  private let playerManager = PlayerManager.shared
+  private let downloadManager = DownloadManager.shared
+  private var apiEpisodes: [PodcastEpisode] = []
+  private var localPodcast: LocalPodcast?
+  private var cancellables = Set<AnyCancellable>()
+  private let episodeID: String?
+  private let preferences = UserPreferences.shared
+
+  init(podcastID: String, episodeID: String? = nil) {
+    self.episodeID = episodeID
+    super.init(podcastID: podcastID)
+    selectedFilter = preferences.podcastEpisodeFilter
+    selectedSort = preferences.podcastEpisodeSort
+    ascending = preferences.podcastEpisodeSortAscending
+
+    let autoQueue = preferences.podcastAutoQueueSetting(for: podcastID)
+    autoQueuePosition = autoQueue.position
+    autoQueueLimit = autoQueue.limit
+
+    observePlayer()
+    observeDownloadStates()
+  }
+
+  override func onAutoQueueChanged(_ position: PodcastAutoQueueSettings.Position, _ limit: PodcastAutoQueueLimit) {
+    autoQueuePosition = position
+    autoQueueLimit = limit
+
+    var setting = preferences.podcastAutoQueueSetting(for: podcastID)
+    let wasEnabled = setting.position.isEnabled
+    setting.position = position
+    setting.limit = limit
+
+    if position.isEnabled && !wasEnabled {
+      setting.baselinePublishedAt = newestKnownPublishedAt() ?? Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    preferences.setPodcastAutoQueueSetting(setting, for: podcastID)
+  }
+
+  private func newestKnownPublishedAt() -> Int64? {
+    if let newest = apiEpisodes.compactMap({ $0.publishedAt }).max() {
+      return newest
+    }
+    return
+      episodes
+      .compactMap { $0.publishedAt }
+      .map { Int64($0.timeIntervalSince1970 * 1000) }
+      .max()
+  }
+
+  override func onFilterChanged(_ filter: EpisodeFilter) {
+    selectedFilter = filter
+    preferences.podcastEpisodeFilter = filter
+  }
+
+  override func onSortOptionTapped(_ sort: EpisodeSort) {
+    super.onSortOptionTapped(sort)
+    preferences.podcastEpisodeSort = selectedSort
+    preferences.podcastEpisodeSortAscending = ascending
+  }
+
+  override func onAppear() {
+    guard apiEpisodes.isEmpty else { return }
+    Task {
+      loadLocalPodcast()
+      await loadPodcast()
+    }
+  }
+
+  override func onPlayEpisode(_ episode: Episode) {
+    if playerManager.current?.id == episode.id {
+      if let currentPlayer = playerManager.current as? BookPlayerModel {
+        currentPlayer.onTogglePlaybackTapped()
+      }
+      return
+    }
+
+    if let mediaProgress = try? MediaProgress.fetch(bookID: episode.id), mediaProgress.isFinished {
+      mediaProgress.currentTime = 0
+    }
+
+    if let apiEpisode = apiEpisodes.first(where: { $0.id == episode.id }) {
+      playerManager.setCurrent(
+        episode: apiEpisode,
+        podcastID: podcastID,
+        podcastTitle: title,
+        podcastAuthor: author,
+        coverURL: coverURL
+      )
+      playerManager.play()
+    } else if let localEpisode = localPodcast?.episodes.first(where: { $0.episodeID == episode.id }) {
+      playerManager.setCurrent(localEpisode)
+      playerManager.play()
+    }
+  }
+
+  override func onDownloadAllEpisodes() {
+    let episodes = filteredEpisodes.filter { $0.downloadState == .notDownloaded }
+
+    for episode in episodes {
+      if let apiEpisode = apiEpisodes.first(where: { $0.id == episode.id }) {
+        downloadManager.startDownload(apiEpisode, podcastID: podcastID, coverURL: coverURL)
+      } else if let localEpisode = localPodcast?.episodes.first(where: { $0.episodeID == episode.id }) {
+        downloadManager.startDownload(localEpisode)
+      }
+    }
+  }
+
+  override func onPlayAllEpisodes() {
+    let episodes = filteredEpisodes.filter { !$0.isCompleted }
+    guard let first = episodes.first else { return }
+
+    if playerManager.current?.id != first.id {
+      onPlayEpisode(first)
+    } else if !playerManager.isPlaying {
+      playerManager.play()
+    }
+
+    for episode in episodes.dropFirst() {
+      playerManager.addToQueue(
+        QueueItem(
+          bookID: episode.id,
+          title: episode.title,
+          details: episode.durationText,
+          coverURL: coverURL,
+          podcastID: podcastID
+        )
+      )
+    }
+  }
+
+  private func observeDownloadStates() {
+    downloadManager.$downloadStates
+      .sink { [weak self] states in
+        guard let self else { return }
+        for index in episodes.indices {
+          let epID = episodes[index].id
+          let newState = states[epID] ?? .notDownloaded
+          if episodes[index].downloadState != newState {
+            episodes[index].downloadState = newState
+          }
+        }
+      }
+      .store(in: &cancellables)
+  }
+
+  private func observePlayer() {
+    playerManager.$current
+      .sink { [weak self] newCurrent in
+        guard let self else { return }
+        observeIsPlaying(newCurrent)
+      }
+      .store(in: &cancellables)
+  }
+
+  private func observeIsPlaying(_ current: BookPlayer.Model?) {
+    guard let current, current.podcastID == podcastID else {
+      currentlyPlayingEpisodeID = nil
+      isPlaying = false
+      return
+    }
+
+    updatePlayingState()
+
+    withObservationTracking {
+      _ = current.isPlaying
+    } onChange: { [weak self] in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        self.updatePlayingState()
+        self.observeIsPlaying(playerManager.current)
+      }
+    }
+  }
+
+  private func updatePlayingState() {
+    let current = playerManager.current
+    if current?.podcastID == podcastID {
+      currentlyPlayingEpisodeID = current?.id
+      isPlaying = current?.isPlaying ?? false
+    } else {
+      currentlyPlayingEpisodeID = nil
+      isPlaying = false
+    }
+    refreshEpisodeProgress()
+  }
+
+  private func refreshEpisodeProgress() {
+    for index in episodes.indices {
+      let progress = MediaProgress.progress(for: episodes[index].id)
+      let isCompleted = progress >= 1.0
+      if episodes[index].progress != progress || episodes[index].isCompleted != isCompleted {
+        episodes[index].progress = progress
+        episodes[index].isCompleted = isCompleted
+      }
+    }
+  }
+
+  private func loadLocalPodcast() {
+    do {
+      guard let podcast = try LocalPodcast.fetch(podcastID: podcastID) else { return }
+      localPodcast = podcast
+
+      title = podcast.title
+      author = podcast.author
+      coverURL = podcast.coverURL(raw: true)
+      description = podcast.podcastDescription?.replacingOccurrences(of: "\n", with: "<br>")
+      genres = podcast.genres
+      language = podcast.language
+      podcastType = podcast.podcastType
+
+      isLoading = false
+      scrollToEpisodeID = episodeID
+
+      showCachedEpisodes(podcast)
+    } catch {
+      AppLogger.viewModel.error("Failed to load local podcast: \(error)")
+    }
+  }
+
+  private func showCachedEpisodes(_ podcast: LocalPodcast) {
+    let localEpisodes = podcast.episodes
+
+    episodeCount = localEpisodes.count
+
+    let totalDuration = localEpisodes.reduce(0.0) { $0 + $1.duration }
+    if totalDuration > 0 {
+      durationText = Duration.seconds(totalDuration).formatted(
+        .units(allowed: [.hours, .minutes], width: .narrow)
+      )
+    }
+
+    episodes = localEpisodes.map { localEpisode in
+      let progress = MediaProgress.progress(for: localEpisode.episodeID)
+      let downloadState = downloadManager.downloadStates[localEpisode.episodeID] ?? .notDownloaded
+
+      let chapters = localEpisode.orderedChapters.map { chapter in
+        Chapter(
+          id: chapter.id,
+          start: chapter.start,
+          end: chapter.end,
+          title: chapter.title
+        )
+      }
+
+      let contextMenu = PodcastEpisodeContextMenuModel(
+        episodeID: localEpisode.episodeID,
+        podcastID: podcastID,
+        podcastTitle: title,
+        podcastAuthor: author,
+        coverURL: coverURL,
+        episodeTitle: localEpisode.title,
+        episodeDuration: localEpisode.duration,
+        episodeSize: nil,
+        isCompleted: progress >= 1.0,
+        progress: progress
+      )
+      contextMenu.onProgressChanged = { [weak self] in
+        self?.refreshEpisodeProgress()
+      }
+
+      return Episode(
+        id: localEpisode.episodeID,
+        title: localEpisode.title,
+        season: localEpisode.season,
+        episode: localEpisode.episode,
+        publishedAt: localEpisode.publishedAt,
+        duration: localEpisode.duration,
+        size: nil,
+        description: localEpisode.episodeDescription,
+        summary: localEpisode.episodeDescription?.htmlStripped,
+        isCompleted: progress >= 1.0,
+        progress: progress,
+        chapters: chapters,
+        downloadState: downloadState,
+        contextMenu: contextMenu
+      )
+    }
+
+    episodesLoading = false
+  }
+
+  private func loadPodcast() async {
+    if episodes.isEmpty {
+      episodesLoading = true
+    }
+
+    do {
+      let podcast = try await podcastsService.fetch(id: podcastID)
+
+      title = podcast.title
+      author = podcast.author
+      coverURL = podcast.coverURL(raw: true)
+      description = podcast.description?.replacingOccurrences(of: "\n", with: "<br>")
+      genres = podcast.genres
+      tags = podcast.tags
+      libraryID = podcast.libraryID
+      isExplicit = podcast.media.metadata.explicit ?? false
+      language = podcast.language
+      podcastType = podcast.podcastType
+      feedURL = podcast.feedURL
+
+      apiEpisodes = podcast.media.episodes ?? []
+
+      episodeCount = apiEpisodes.count
+
+      let totalDuration = apiEpisodes.reduce(0.0) { $0 + ($1.duration ?? 0) }
+      if totalDuration > 0 {
+        durationText = Duration.seconds(totalDuration).formatted(
+          .units(
+            allowed: [.hours, .minutes],
+            width: .narrow
+          )
+        )
+      }
+
+      episodes = apiEpisodes.map { apiEpisode in
+        let publishedAt: Date?
+        if let timestamp = apiEpisode.publishedAt {
+          publishedAt = Date(timeIntervalSince1970: TimeInterval(timestamp) / 1000)
+        } else {
+          publishedAt = nil
+        }
+
+        let chapters = (apiEpisode.chapters ?? []).map { apiChapter in
+          Chapter(
+            id: apiChapter.id,
+            start: apiChapter.start,
+            end: apiChapter.end,
+            title: apiChapter.title
+          )
+        }
+
+        let progress = MediaProgress.progress(for: apiEpisode.id)
+
+        let downloadState = downloadManager.downloadStates[apiEpisode.id] ?? .notDownloaded
+
+        let size = apiEpisode.audioTrack?.metadata?.size ?? apiEpisode.size
+        let contextMenu = PodcastEpisodeContextMenuModel(
+          episodeID: apiEpisode.id,
+          podcastID: podcastID,
+          podcastTitle: title,
+          podcastAuthor: author,
+          coverURL: coverURL,
+          episodeTitle: apiEpisode.title,
+          episodeDuration: apiEpisode.duration,
+          episodeSize: size,
+          isCompleted: progress >= 1.0,
+          progress: progress,
+          apiEpisode: apiEpisode
+        )
+        contextMenu.onProgressChanged = { [weak self] in
+          self?.refreshEpisodeProgress()
+        }
+
+        return Episode(
+          id: apiEpisode.id,
+          title: apiEpisode.title,
+          season: apiEpisode.season,
+          episode: apiEpisode.episode,
+          publishedAt: publishedAt,
+          duration: apiEpisode.duration,
+          size: size,
+          description: apiEpisode.description,
+          summary: apiEpisode.description?.htmlStripped,
+          isCompleted: progress >= 1.0,
+          progress: progress,
+          chapters: chapters,
+          downloadState: downloadState,
+          contextMenu: contextMenu,
+          apiEpisode: apiEpisode
+        )
+      }
+
+      error = nil
+      isLoading = false
+      episodesLoading = false
+      scrollToEpisodeID = episodeID
+    } catch {
+      if localPodcast == nil {
+        self.error = "Failed to load podcast details. Please check your connection and try again."
+      } else if NetworkMonitor.shared.isConnected {
+        Toast(error: "Couldn't refresh episodes. Showing downloaded episodes only.").show()
+      }
+      isLoading = false
+      episodesLoading = false
+      AppLogger.viewModel.error("Failed to load podcast: \(error)")
+    }
+  }
+}

@@ -1,0 +1,202 @@
+import API
+import AuthenticationServices
+import Combine
+import SwiftUI
+
+struct AuthenticationView: View {
+  enum FocusField: Hashable {
+    case username
+    case password
+    case apiKey
+  }
+
+  @Environment(\.dismiss) var dismiss
+  @Environment(\.webAuthenticationSession) private var webAuthenticationSession
+
+  @FocusState private var focusedField: FocusField?
+
+  @StateObject var model: Model
+
+  var body: some View {
+    Group {
+      if model.availableAuthMethods.count > 1 {
+        Section("Authentication Method") {
+          Picker("Method", selection: $model.authenticationMethod) {
+            ForEach(model.availableAuthMethods, id: \.self) { method in
+              switch method {
+              case .usernamePassword:
+                Text("Username & Password").tag(method)
+              case .oidc:
+                Text("OIDC (SSO)").tag(method)
+              case .apiKey:
+                Text("API Key").tag(method)
+              }
+            }
+          }
+          .pickerStyle(.segmented)
+        }
+      }
+
+      if model.authenticationMethod == .usernamePassword {
+        Section("Credentials") {
+          TextField("Username", text: $model.username)
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.never)
+            .focused($focusedField, equals: .username)
+            .submitLabel(.next)
+            .onSubmit {
+              focusedField = .password
+            }
+
+          SecureField("Password", text: $model.password)
+            .focused($focusedField, equals: .password)
+            .submitLabel(.send)
+            .onSubmit {
+              model.onLoginTapped()
+            }
+        }
+
+        Section {
+          Button(action: model.onLoginTapped) {
+            HStack {
+              if model.isLoading {
+                ProgressView()
+                  .scaleEffect(0.8)
+              } else {
+                Image(systemName: "person.badge.key")
+              }
+              Text(model.isLoading ? "Logging in..." : "Login")
+            }
+          }
+          .disabled(
+            model.username.isEmpty || model.password.isEmpty || model.isLoading
+          )
+        }
+      } else if model.authenticationMethod == .apiKey {
+        Section("API Key") {
+          SecureField("API Key", text: $model.apiKey)
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.never)
+            .focused($focusedField, equals: .apiKey)
+            .submitLabel(.send)
+            .onSubmit {
+              model.onAPIKeyLoginTapped()
+            }
+        }
+
+        Section {
+          Button(action: model.onAPIKeyLoginTapped) {
+            HStack {
+              if model.isLoading {
+                ProgressView()
+                  .scaleEffect(0.8)
+              } else {
+                Image(systemName: "person.badge.key")
+              }
+              Text(model.isLoading ? "Authenticating..." : "Authenticate")
+            }
+          }
+          .disabled(model.apiKey.isEmpty || model.isLoading)
+        } footer: {
+          if let serverURL = model.serverURL {
+            Link(
+              "Create an API key",
+              destination: serverURL.appending(path: "config/api-keys/")
+            )
+          }
+        }
+      } else {
+        Section {
+          Button {
+            model.onOIDCLoginTapped(using: webAuthenticationSession)
+          } label: {
+            HStack {
+              if model.isLoading {
+                ProgressView()
+                  .scaleEffect(0.8)
+              } else {
+                Image(systemName: "globe")
+              }
+              Text(model.isLoading ? "Authenticating..." : "Login with SSO")
+            }
+          }
+          .disabled(model.isLoading)
+        } footer: {
+          Text("Add **audiobooth://oauth** to audiobookshelf server redirect URIs")
+            .textSelection(.enabled)
+            .font(.footnote)
+        }
+        .onChange(of: model.shouldAutoLaunchOIDC) { _, shouldAutoLaunch in
+          if shouldAutoLaunch {
+            model.shouldAutoLaunchOIDC = false
+            model.onOIDCLoginTapped(using: webAuthenticationSession)
+          }
+        }
+      }
+    }
+    .onChange(of: model.shouldDismiss) { _, shouldDismiss in
+      if shouldDismiss {
+        dismiss()
+      }
+    }
+  }
+}
+
+extension AuthenticationView {
+  @Observable
+  class Model: ObservableObject {
+    enum AuthenticationMethod: CaseIterable, Hashable {
+      case usernamePassword
+      case oidc
+      case apiKey
+    }
+
+    var isLoading: Bool
+    var username: String
+    var password: String
+    var apiKey: String
+    var serverURL: URL?
+    var authenticationMethod: AuthenticationMethod
+    var availableAuthMethods: [AuthenticationMethod]
+    var shouldAutoLaunchOIDC: Bool
+    var onAuthenticationSuccess: () -> Void
+
+    var shouldDismiss: Bool = false
+
+    func onLoginTapped() {}
+    func onOIDCLoginTapped(using session: WebAuthenticationSession) {}
+    func onAPIKeyLoginTapped() {}
+
+    init(
+      isLoading: Bool = false,
+      username: String = "",
+      password: String = "",
+      apiKey: String = "",
+      serverURL: URL? = nil,
+      authenticationMethod: AuthenticationMethod = .usernamePassword,
+      availableAuthMethods: [AuthenticationMethod] = [.usernamePassword, .oidc, .apiKey],
+      shouldAutoLaunchOIDC: Bool = false,
+      onAuthenticationSuccess: @escaping () -> Void = {}
+    ) {
+      self.isLoading = isLoading
+      self.username = username
+      self.password = password
+      self.apiKey = apiKey
+      self.serverURL = serverURL
+      self.authenticationMethod = authenticationMethod
+      self.availableAuthMethods = availableAuthMethods
+      self.shouldAutoLaunchOIDC = shouldAutoLaunchOIDC
+      self.onAuthenticationSuccess = onAuthenticationSuccess
+    }
+  }
+}
+
+extension AuthenticationView.Model {
+  static var mock = AuthenticationView.Model()
+}
+
+#Preview {
+  NavigationStack {
+    AuthenticationView(model: .mock)
+  }
+}

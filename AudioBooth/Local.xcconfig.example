@@ -1,0 +1,16 @@
+// Local.xcconfig
+// Copy this file to Local.xcconfig and update with your settings.
+// Local.xcconfig is gitignored and will not be committed.
+//
+// To find your Team ID, open Xcode → Settings → Accounts → select your Apple ID → look at the Team list.
+
+DEVELOPMENT_TEAM = YOUR_TEAM_ID_HERE
+ORG_IDENTIFIER = com.YOUR_ORG_HERE
+
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) CONTRIBUTOR_BUILD
+
+// Optional: the companion server a fresh install of your own build starts with. Leave these out and
+// the app asks nobody until an address is typed into Settings. No scheme, because an xcconfig reads //
+// as a comment: a bare hostname becomes https, an IP or host:port becomes http. See docs/SELF-HOSTING.md.
+// COMPANION_DAEMON_URL = captions.example.com
+// COMPANION_WORKER_URL = jobs.example.com

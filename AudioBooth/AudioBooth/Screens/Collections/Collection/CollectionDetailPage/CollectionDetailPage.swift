@@ -1,0 +1,529 @@
+import API
+import Combine
+import SwiftUI
+
+struct CollectionDetailPage: View {
+  @Environment(\.appTheme) var theme
+  @Environment(\.dismiss) var dismiss
+  @ObservedObject private var preferences = UserPreferences.shared
+
+  @StateObject var model: Model
+  @Environment(\.editMode) private var editMode
+  @State private var showDeleteConfirmation = false
+  @State private var showEditSheet = false
+  @State private var showPinnedPreferences = false
+
+  @ScaledMetric(relativeTo: .title) private var gridMinimum: CGFloat = 100
+  @ScaledMetric(relativeTo: .title) private var rowCoverSize: CGFloat = 60
+  @ScaledMetric(relativeTo: .title) private var deleteButtonSize: CGFloat = 24
+
+  private var isCardMode: Bool {
+    preferences.libraryDisplayMode == .card
+  }
+
+  var body: some View {
+    Group {
+      if model.isLoading && model.books.isEmpty {
+        ProgressView("Loading...")
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if model.books.isEmpty && !model.isLoading {
+        emptyStateView
+      } else if isCardMode {
+        cardView
+      } else {
+        listView
+      }
+    }
+    .background(theme.colors.background.page.ignoresSafeArea())
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      if model.mode == .playlists {
+        ToolbarItem(placement: .topBarTrailing) {
+          if model.isPinned {
+            Menu {
+              Button {
+                showPinnedPreferences = true
+              } label: {
+                Label("Preferences", systemImage: "gearshape")
+              }
+
+              Divider()
+
+              Button(role: .destructive) {
+                model.onTogglePin()
+              } label: {
+                Label("Unpin", systemImage: "pin.slash")
+              }
+              .tint(.red)
+            } label: {
+              Image(systemName: "pin.fill")
+            }
+            .tint(.primary)
+          } else {
+            Button {
+              model.onTogglePin()
+            } label: {
+              Image(systemName: "pin")
+            }
+            .tint(.primary)
+          }
+        }
+      }
+
+      if model.canEdit {
+        ToolbarItem(placement: .topBarTrailing) {
+          EditButton()
+            .tint(.primary)
+        }
+      }
+
+      ToolbarItem(placement: .topBarTrailing) {
+        Menu {
+          Toggle(
+            isOn: Binding(
+              get: { preferences.libraryDisplayMode == .card },
+              set: { if $0 { preferences.libraryDisplayMode = .card } }
+            )
+          ) {
+            Label("Grid View", systemImage: "square.grid.2x2")
+          }
+
+          Toggle(
+            isOn: Binding(
+              get: { preferences.libraryDisplayMode == .row },
+              set: { if $0 { preferences.libraryDisplayMode = .row } }
+            )
+          ) {
+            Label("List View", systemImage: "rectangle.grid.1x2")
+          }
+
+          Divider()
+
+          Button(action: model.onDownloadAllTapped) {
+            Label("Download All", systemImage: "arrow.down.circle")
+          }
+
+          if !model.books.isEmpty {
+            Button(action: model.onAddAllToQueueTapped) {
+              Label("Queue All", systemImage: "text.badge.plus")
+            }
+          }
+
+          if model.canEdit {
+            Divider()
+
+            Button {
+              showEditSheet = true
+            } label: {
+              Label("Rename", systemImage: "pencil")
+            }
+          }
+
+          if model.canDelete {
+            Divider()
+
+            Button(role: .destructive) {
+              showDeleteConfirmation = true
+            } label: {
+              Label(deleteActionTitle, systemImage: "trash")
+            }
+            .tint(.red)
+          }
+        } label: {
+          Label("More", systemImage: "ellipsis")
+        }
+        .confirmationDialog(
+          deleteConfirmationMessage,
+          isPresented: $showDeleteConfirmation,
+          titleVisibility: .visible
+        ) {
+          Button(deleteActionTitle, role: .destructive) {
+            model.onDeleteCollection()
+          }
+          Button("Cancel", role: .cancel) {}
+        }
+        .queueChoiceDialog($model.queueChoice, onSelect: model.onQueueChoiceSelected)
+        .tint(.primary)
+      }
+    }
+    .refreshable {
+      await model.refresh()
+    }
+    .sheet(isPresented: $showEditSheet) {
+      EditPlaylistSheet(
+        name: model.collectionName,
+        description: model.collectionDescription ?? "",
+        onSave: { name, description in
+          model.onUpdateCollection(name: name, description: description.isEmpty ? nil : description)
+        }
+      )
+    }
+    .adaptiveSheet(isPresented: $showPinnedPreferences) {
+      PinnedPlaylistPreferencesSheet(model: model)
+    }
+    .onAppear {
+      model.onAppear()
+      if let pageModel = model as? CollectionDetailPageModel {
+        pageModel.onDeleted = { dismiss() }
+      }
+    }
+  }
+
+  private var emptyStateMessage: LocalizedStringResource {
+    switch model.mode {
+    case .playlists: "This playlist is empty."
+    case .collections: "This collection is empty."
+    }
+  }
+
+  private var deleteActionTitle: LocalizedStringResource {
+    switch model.mode {
+    case .playlists: "Delete Playlist"
+    case .collections: "Delete Collection"
+    }
+  }
+
+  private var deleteConfirmationMessage: LocalizedStringResource {
+    switch model.mode {
+    case .playlists: "Are you sure you want to remove your playlist \"\(model.collectionName)\"?"
+    case .collections: "Are you sure you want to remove this collection?"
+    }
+  }
+
+  private var emptyStateView: some View {
+    ContentUnavailableView(
+      "No Books",
+      systemImage: "music.note.list",
+      description: Text(emptyStateMessage)
+    )
+  }
+
+  private var cardView: some View {
+    ScrollView {
+      VStack(alignment: .leading) {
+        titleHeader
+
+        LazyVGrid(
+          columns: [GridItem(.adaptive(minimum: gridMinimum), spacing: 20)],
+          spacing: 20
+        ) {
+          ForEach(model.books) { book in
+            BookCard(model: book)
+              .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+              .allowsHitTesting(editMode?.wrappedValue.isEditing != true)
+              .overlay(alignment: .topLeading) {
+                if editMode?.wrappedValue.isEditing == true {
+                  Button {
+                    if let index = model.books.firstIndex(where: { $0.id == book.id }) {
+                      model.onDelete(at: IndexSet(integer: index))
+                    }
+                  } label: {
+                    Image(systemName: "minus.circle.fill")
+                      .resizable()
+                      .frame(width: deleteButtonSize, height: deleteButtonSize)
+                      .symbolRenderingMode(.palette)
+                      .foregroundStyle(.white, .red)
+                  }
+                  .offset(x: -deleteButtonSize * 0.3, y: -deleteButtonSize * 0.3)
+                  .transition(.scale.combined(with: .opacity))
+                }
+              }
+          }
+        }
+        .padding(.horizontal)
+      }
+    }
+    .environment(\.itemDisplayMode, .card)
+  }
+
+  private var listView: some View {
+    List {
+      Section {
+        titleHeader
+      }
+      .listRowInsets(EdgeInsets())
+      .listRowBackground(Color.clear)
+      .listRowSeparator(.hidden)
+
+      Section {
+        ForEach(model.books) { book in
+          if book.podcastID != nil {
+            episodeRow(book)
+          } else {
+            BookListCard(model: book)
+          }
+        }
+        .onMove { source, destination in
+          model.onMove(from: source, to: destination)
+        }
+        .onDelete { indexSet in
+          model.onDelete(at: indexSet)
+        }
+      }
+      .listRowBackground(Color.clear)
+    }
+    .listStyle(.plain)
+    .environment(\.itemDisplayMode, .row)
+  }
+
+  private func episodeRow(_ book: BookCard.Model) -> some View {
+    HStack(spacing: 12) {
+      Cover(model: book.cover, size: .small)
+        .frame(width: rowCoverSize, height: rowCoverSize)
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text(book.title)
+          .font(.caption)
+          .foregroundColor(.primary)
+          .fontWeight(.medium)
+          .lineLimit(1)
+
+        if let author = book.author {
+          Text(author)
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+        }
+
+        if let details = book.details {
+          Text(details)
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+        }
+
+        Spacer(minLength: 0)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      Button {
+        model.onPlayItem(book)
+      } label: {
+        Image(systemName: "play.fill")
+          .font(.title3)
+          .foregroundStyle(Color.accentColor)
+      }
+      .buttonStyle(.plain)
+    }
+    .contentShape(Rectangle())
+    .overlay {
+      NavigationLink(value: NavigationDestination.podcast(id: book.podcastID ?? book.id)) {}
+        .opacity(0)
+    }
+  }
+
+  private var titleHeader: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      VStack(alignment: .leading, spacing: 4) {
+        Text(model.collectionName.isEmpty ? "Untitled" : model.collectionName)
+          .font(.title2)
+          .fontWeight(.bold)
+          .foregroundColor(.primary)
+
+        if let description = model.collectionDescription, !description.isEmpty {
+          Text(description)
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .lineLimit(3)
+        }
+      }
+
+      HStack {
+        Text("^[\(model.books.count) item](inflect: true)")
+          .font(.caption)
+          .foregroundStyle(.tertiary)
+
+        Spacer()
+
+        if !model.books.isEmpty {
+          Button(action: model.onPlayAll) {
+            HStack(spacing: 4) {
+              Image(systemName: "play.fill")
+              Text("Play All")
+            }
+            .font(.caption)
+            .fontWeight(.medium)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .foregroundStyle(Color.accentColor)
+            .background(Color.accentColor.opacity(0.15))
+            .clipShape(Capsule())
+          }
+          .buttonStyle(.plain)
+        }
+      }
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 12)
+  }
+}
+
+extension CollectionDetailPage {
+  @Observable
+  class Model: ObservableObject {
+    var isLoading: Bool
+    var collectionName: String
+    var collectionDescription: String?
+    var books: [BookCard.Model]
+    var mode: CollectionMode
+    var canEdit: Bool
+    var canDelete: Bool
+    var isPinned: Bool
+    var autoDownload: AutoDownloadMode
+    var removeCompleted: Bool
+    var queueChoice: QueueChoice?
+
+    func onAppear() {}
+    func refresh() async {}
+    func onDeleteCollection() {}
+    func onUpdateCollection(name: String, description: String?) {}
+    func onMove(from source: IndexSet, to destination: Int) {}
+    func onDelete(at indexSet: IndexSet) {}
+    func onTogglePin() {}
+    func onPlayItem(_ item: BookCard.Model) {}
+    func onPlayAll() {}
+    func onAddAllToQueueTapped() {}
+    func onQueueChoiceSelected(_ choice: QueueChoice, scope: QueueChoice.Scope) {}
+    func onAutoDownloadChanged(_ mode: AutoDownloadMode) {}
+    func onRemoveCompletedChanged(_ value: Bool) {}
+    func onDownloadAllTapped() {}
+
+    init(
+      isLoading: Bool = false,
+      collectionName: String = "",
+      collectionDescription: String? = nil,
+      books: [BookCard.Model] = [],
+      mode: CollectionMode = .playlists,
+      canEdit: Bool = false,
+      canDelete: Bool = false,
+      isPinned: Bool = false,
+      autoDownload: AutoDownloadMode = .off,
+      removeCompleted: Bool = false
+    ) {
+      self.isLoading = isLoading
+      self.collectionName = collectionName
+      self.collectionDescription = collectionDescription
+      self.books = books
+      self.mode = mode
+      self.canEdit = canEdit
+      self.canDelete = canDelete
+      self.isPinned = isPinned
+      self.autoDownload = autoDownload
+      self.removeCompleted = removeCompleted
+    }
+  }
+}
+
+extension CollectionDetailPage.Model: Hashable {
+  static func == (lhs: CollectionDetailPage.Model, rhs: CollectionDetailPage.Model) -> Bool {
+    ObjectIdentifier(lhs) == ObjectIdentifier(rhs)
+  }
+
+  func hash(into hasher: inout Hasher) {
+    hasher.combine(ObjectIdentifier(self))
+  }
+}
+
+extension CollectionDetailPage.Model {
+  static var mock: CollectionDetailPage.Model {
+    CollectionDetailPage.Model(
+      collectionName: "My Favorites",
+      collectionDescription: "My favorite audiobooks to listen to",
+      books: [
+        BookCard.Model(
+          id: "1",
+          title: "The Name of the Wind",
+          cover: Cover.Model(
+            url: URL(string: "https://m.media-amazon.com/images/I/51YHc7SK5HL._SL500_.jpg"),
+            progress: 0.45
+          ),
+          author: "Patrick Rothfuss"
+        ),
+        BookCard.Model(
+          id: "2",
+          title: "Project Hail Mary",
+          cover: Cover.Model(
+            url: URL(string: "https://m.media-amazon.com/images/I/41rrXYM-wHL._SL500_.jpg")
+          ),
+          author: "Andy Weir"
+        ),
+      ]
+    )
+  }
+}
+
+private struct PinnedPlaylistPreferencesSheet: View {
+  @ObservedObject var model: CollectionDetailPage.Model
+
+  var body: some View {
+    VStack(spacing: 0) {
+      Text("Pinned Playlist")
+        .font(.title3)
+        .fontWeight(.semibold)
+        .padding(.top, 32)
+        .padding(.bottom, 20)
+
+      VStack(spacing: 0) {
+        HStack {
+          Text("Auto-Download")
+            .font(.subheadline)
+            .bold()
+
+          Spacer()
+
+          Picker(
+            "Auto-Download",
+            selection: Binding(
+              get: { model.autoDownload },
+              set: { model.onAutoDownloadChanged($0) }
+            )
+          ) {
+            ForEach(AutoDownloadMode.allCases, id: \.rawValue) { mode in
+              Text(mode.displayName).tag(mode)
+                .foregroundStyle(.secondary)
+            }
+          }
+          .labelsHidden()
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 12)
+
+        Divider()
+          .padding(.leading)
+
+        Toggle(
+          "Remove Completed",
+          isOn: Binding(
+            get: { model.removeCompleted },
+            set: { model.onRemoveCompletedChanged($0) }
+          )
+        )
+        .font(.subheadline)
+        .bold()
+        .padding(.horizontal)
+        .padding(.vertical, 12)
+      }
+      .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+      .padding(.horizontal)
+      .padding(.bottom, 32)
+    }
+  }
+}
+
+#Preview("CollectionDetailPage - Loading") {
+  NavigationStack {
+    CollectionDetailPage(model: .init(isLoading: true))
+  }
+}
+
+#Preview("CollectionDetailPage - Empty") {
+  NavigationStack {
+    CollectionDetailPage(model: .init())
+  }
+}
+
+#Preview("CollectionDetailPage - With Books") {
+  NavigationStack {
+    CollectionDetailPage(model: .mock)
+  }
+}

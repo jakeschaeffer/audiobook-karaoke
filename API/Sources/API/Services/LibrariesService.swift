@@ -1,0 +1,236 @@
+import Combine
+import Foundation
+import Logging
+import Nuke
+
+@MainActor
+public final class LibrariesService: ObservableObject {
+  private let audiobookshelf: Audiobookshelf
+
+  enum Keys {
+    static let library = "selected_library"
+    static func personalized(libraryID: String) -> String {
+      "personalized_\(libraryID)"
+    }
+    static let libraries = "libraries"
+  }
+
+  init(audiobookshelf: Audiobookshelf) {
+    self.audiobookshelf = audiobookshelf
+  }
+
+  func migrateToConnectionStorage() {
+    guard let storage = audiobookshelf.authentication.server?.storage else { return }
+
+    let standard = UserDefaults.standard
+
+    if let data = standard.data(forKey: "audiobookshelf_selected_library") {
+      storage.set(data, forKey: Keys.library)
+      standard.removeObject(forKey: "audiobookshelf_selected_library")
+    }
+
+    if let data = standard.data(forKey: "selected_library") {
+      storage.set(data, forKey: Keys.library)
+      standard.removeObject(forKey: "selected_library")
+    }
+
+    if let data = standard.data(forKey: "libraries") {
+      storage.set(data, forKey: Keys.libraries)
+      standard.removeObject(forKey: "libraries")
+    }
+
+    let allKeys = standard.dictionaryRepresentation().keys
+    for key in allKeys {
+      if key.hasPrefix("personalized_") || key.hasPrefix("filterdata_") {
+        storage.set(standard.data(forKey: key), forKey: key)
+        standard.removeObject(forKey: key)
+      }
+    }
+  }
+
+  public var current: Library? {
+    get {
+      guard let server = audiobookshelf.authentication.server,
+        let data = server.storage.data(forKey: Keys.library),
+        var library = try? JSONDecoder().decode(Library.self, from: data)
+      else { return nil }
+
+      if library.serverID.isEmpty {
+        library.serverID = server.id
+      }
+
+      return library
+    }
+    set {
+      objectWillChange.send()
+      if let newValue {
+        guard let data = try? JSONEncoder().encode(newValue) else { return }
+        audiobookshelf.authentication.server?.storage.set(data, forKey: Keys.library)
+      } else {
+        audiobookshelf.authentication.server?.storage.removeObject(forKey: Keys.library)
+      }
+      ImagePipeline.shared.cache.removeAll()
+    }
+  }
+
+  public var libraries: [Library] {
+    get {
+      guard let data = audiobookshelf.authentication.server?.storage.data(forKey: Keys.libraries) else { return [] }
+      return (try? JSONDecoder().decode([Library].self, from: data)) ?? []
+    }
+    set {
+      objectWillChange.send()
+      guard let data = try? JSONEncoder().encode(newValue) else { return }
+      audiobookshelf.authentication.server?.storage.set(data, forKey: Keys.libraries)
+    }
+  }
+
+  public func clearAllCaches() {
+    audiobookshelf.filterData.clearCache()
+
+    guard let storage = audiobookshelf.authentication.server?.storage else { return }
+    for key in storage.dictionaryRepresentation().keys where key.hasPrefix("personalized_") {
+      storage.removeObject(forKey: key)
+    }
+  }
+
+  public func fetch(serverID: String? = nil) async throws -> [Library] {
+    let networkService: NetworkService
+
+    if let serverID {
+      guard let server = audiobookshelf.authentication.servers[serverID] else {
+        throw Audiobookshelf.AudiobookshelfError.networkError("Server not found")
+      }
+      networkService = NetworkService(baseURL: server.baseURL, server: server) {
+        let freshToken = try? await server.freshToken
+        guard let credentials = freshToken else {
+          return [:]
+        }
+
+        var headers = await server.customHeaders
+        headers["Authorization"] = credentials.bearer
+        return headers
+      }
+    } else {
+      guard let service = audiobookshelf.networkService else {
+        throw Audiobookshelf.AudiobookshelfError.networkError(
+          "Network service not configured. Please login first."
+        )
+      }
+      networkService = service
+    }
+
+    struct Response: Codable {
+      let libraries: [Library]
+    }
+
+    let request = NetworkRequest<Response>(
+      path: "/api/libraries",
+      method: .get
+    )
+
+    do {
+      let response = try await networkService.send(request)
+      let activeServerID = audiobookshelf.authentication.server?.id
+      let targetServerID = serverID ?? activeServerID ?? ""
+      let fetched = response.value.libraries.map { library in
+        var stamped = library
+        stamped.serverID = targetServerID
+        return stamped
+      }
+      if serverID == nil || serverID == activeServerID {
+        libraries = fetched
+      }
+      return fetched
+    } catch {
+      throw Audiobookshelf.AudiobookshelfError.networkError(
+        "Failed to fetch libraries: \(error.localizedDescription)"
+      )
+    }
+  }
+
+  public func getCachedPersonalized() -> Personalized? {
+    guard let library = audiobookshelf.libraries.current else { return nil }
+    let key = Keys.personalized(libraryID: library.id)
+    guard let data = audiobookshelf.authentication.server?.storage.data(forKey: key) else { return nil }
+    return try? JSONDecoder().decode(Personalized.self, from: data)
+  }
+
+  public func fetchPersonalized() async throws -> Personalized {
+    guard let networkService = audiobookshelf.networkService else {
+      throw Audiobookshelf.AudiobookshelfError.networkError(
+        "Network service not configured. Please login first."
+      )
+    }
+
+    guard let library = audiobookshelf.libraries.current else {
+      throw Audiobookshelf.AudiobookshelfError.networkError(
+        "No library selected. Please select a library first."
+      )
+    }
+
+    let request = NetworkRequest<[Personalized.Section]>(
+      path: "/api/libraries/\(library.id)/personalized",
+      method: .get
+    )
+
+    do {
+      let response = try await networkService.send(request)
+
+      let personalized = Personalized(libraryID: library.id, sections: response.value)
+
+      let encoder = JSONEncoder()
+      if let data = try? encoder.encode(personalized) {
+        let key = Keys.personalized(libraryID: personalized.libraryID)
+        audiobookshelf.authentication.server?.storage.set(data, forKey: key)
+      }
+
+      return personalized
+    } catch {
+      throw Audiobookshelf.AudiobookshelfError.networkError(
+        "Failed to fetch personalized sections: \(error.localizedDescription)"
+      )
+    }
+  }
+
+  public func fetchRecentEpisodes(
+    libraryID: String? = nil,
+    limit: Int = 50,
+    page: Int = 0
+  ) async throws -> [RecentEpisode] {
+    guard let networkService = audiobookshelf.networkService else {
+      throw Audiobookshelf.AudiobookshelfError.networkError(
+        "Network service not configured. Please login first."
+      )
+    }
+
+    guard let libraryID = libraryID ?? audiobookshelf.libraries.current?.id else {
+      throw Audiobookshelf.AudiobookshelfError.networkError(
+        "No library selected. Please select a library first."
+      )
+    }
+
+    struct Response: Decodable {
+      let episodes: [RecentEpisode]
+    }
+
+    let request = NetworkRequest<Response>(
+      path: "/api/libraries/\(libraryID)/recent-episodes",
+      method: .get,
+      query: [
+        "limit": "\(limit)",
+        "page": "\(page)",
+      ]
+    )
+
+    do {
+      let response = try await networkService.send(request)
+      return response.value.episodes
+    } catch {
+      throw Audiobookshelf.AudiobookshelfError.networkError(
+        "Failed to fetch recent episodes: \(error.localizedDescription)"
+      )
+    }
+  }
+
+}

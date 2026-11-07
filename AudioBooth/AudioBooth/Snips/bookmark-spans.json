@@ -1,0 +1,78 @@
+{
+  "schema": "bookmark-spans/1",
+  "note": "Reviewed In points for ABS bookmarks (2026-10-30): the bookmark is the Out point, the In point was read from the transcript. Positions only; the text is re-read from the transcript at import.",
+  "spans": [
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 1410,
+      "start_ms": 1357860,
+      "end_ms": 1410000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 4055,
+      "start_ms": 4001520,
+      "end_ms": 4055000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 4585,
+      "start_ms": 4546380,
+      "end_ms": 4585000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 6732,
+      "start_ms": 6681480,
+      "end_ms": 6737460
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 7132,
+      "start_ms": 7121100,
+      "end_ms": 7132000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 9111,
+      "start_ms": 9062220,
+      "end_ms": 9111000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 9237,
+      "start_ms": 9155220,
+      "end_ms": 9239100
+    },
+    {
+      "item_id": "a27b4bbd-7b16-4564-80d4-eb64e558b33d",
+      "bookmark_time": 4253,
+      "start_ms": 4157420,
+      "end_ms": 4253000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 11955,
+      "start_ms": 11885460,
+      "end_ms": 11955000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 12829,
+      "start_ms": 12806040,
+      "end_ms": 12829000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 13570,
+      "start_ms": 13492800,
+      "end_ms": 13570000
+    },
+    {
+      "item_id": "09ed41cb-12af-4acd-ba6f-c3e74044b55b",
+      "bookmark_time": 14887,
+      "start_ms": 14838180,
+      "end_ms": 14887000
+    }
+  ]
+}

@@ -1,0 +1,166 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "Bad request URL.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bad request URL."
+          }
+        }
+      }
+    },
+    "Cleaned text saved to server": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cleaned text saved to server"
+          }
+        }
+      }
+    },
+    "Cleaning up text · %lld/%lld": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cleaning up text · %lld/%lld"
+          }
+        }
+      }
+    },
+    "Cleanup failed: %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cleanup failed: %@"
+          }
+        }
+      }
+    },
+    "Cleanup stopped — progress kept": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cleanup stopped — progress kept"
+          }
+        }
+      }
+    },
+    "Couldn't read this book's audio file (%@).": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't read this book's audio file (%@)."
+          }
+        }
+      }
+    },
+    "Download this book to transcribe it on iPhone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download this book to transcribe it on iPhone."
+          }
+        }
+      }
+    },
+    "No transcript exists for this book yet.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No transcript exists for this book yet."
+          }
+        }
+      }
+    },
+    "Saving cleaned text to server…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Saving cleaned text to server…"
+          }
+        }
+      }
+    },
+    "Text cleaned up": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Text cleaned up"
+          }
+        }
+      }
+    },
+    "Text cleanup needs Apple Intelligence, which isn't available on this device.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Text cleanup needs Apple Intelligence, which isn't available on this device."
+          }
+        }
+      }
+    },
+    "The transcript service gave an unexpected response.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The transcript service gave an unexpected response."
+          }
+        }
+      }
+    },
+    "The transcript service returned HTTP %lld.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The transcript service returned HTTP %lld."
+          }
+        }
+      }
+    },
+    "This book's audio is %@, which iPhone transcription can't read. Use Transcribe on Server instead.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This book's audio is %@, which iPhone transcription can't read. Use Transcribe on Server instead."
+          }
+        }
+      }
+    },
+    "This item has no audio to transcribe.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This item has no audio to transcribe."
+          }
+        }
+      }
+    },
+    "iPhone got too hot — transcription stopped. Finished tracks are kept; run again to resume.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "iPhone got too hot — transcription stopped. Finished tracks are kept; run again to resume."
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

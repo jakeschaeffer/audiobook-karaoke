@@ -1,0 +1,295 @@
+import API
+import SwiftData
+import SwiftUI
+
+struct ContentView: View {
+  @StateObject private var playerManager = PlayerManager.shared
+  @ObservedObject private var libraries = Audiobookshelf.shared.libraries
+  @ObservedObject private var preferences = UserPreferences.shared
+
+  @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.scenePhase) private var scenePhase
+
+  @Namespace private var playerNamespace
+  @State private var isKeyboardVisible = false
+  @State private var selectedTab: TabSelection = .home
+  @StateObject private var libraryModel = LibraryRootPage.Model()
+  @StateObject private var podcastsModel = PodcastsRootPage.Model()
+  @StateObject private var collectionsModel = CollectionsRootPage.Model()
+  @StateObject private var latestModel = LatestViewModel()
+
+  enum TabSelection {
+    case home, latest, library, collections, downloads, search
+  }
+
+  private var tabSelection: Binding<TabSelection> {
+    Binding(
+      get: { selectedTab },
+      set: { newValue in
+        if newValue == selectedTab {
+          switch newValue {
+          case .library:
+            if libraries.current?.mediaType == .podcast {
+              podcastsModel.onTabItemTapped()
+            } else {
+              libraryModel.onTabItemTapped()
+            }
+          case .collections:
+            collectionsModel.onTabItemTapped()
+          default:
+            break
+          }
+        }
+        selectedTab = newValue
+      }
+    )
+  }
+
+  var body: some View {
+    content
+      .observesHinge()
+      .fullScreenCover(isPresented: $playerManager.isShowingFullPlayer) {
+        if let currentPlayer = playerManager.current {
+          if preferences.assistedPlayer {
+            AssistedPlayer(model: currentPlayer)
+              .displayScaled()
+              .interactiveDismissDisabled()
+          } else {
+            BookPlayer(model: currentPlayer)
+              .displayScaled()
+              .zoomTransition(sourceID: "player", in: playerNamespace)
+              .interactiveDismissDisabled(currentPlayer.isLocked)
+          }
+        }
+      }
+      .fullScreenCover(item: $playerManager.reader) { reader in
+        NavigationStack {
+          EbookReaderView(model: reader)
+        }
+        .displayScaled()
+      }
+      .adaptivePresentation(
+        isPresented: Binding(
+          get: {
+            guard let current = playerManager.current else { return false }
+            return current.isQueuePresented && !playerManager.isShowingFullPlayer
+          },
+          set: { newValue in
+            playerManager.current?.isQueuePresented = newValue
+          }
+        )
+      ) {
+        PlayerQueueView(model: PlayerQueueViewModel())
+          .displayScaled()
+      }
+      .adaptiveSheet(
+        isPresented: miniPlayerBinding(
+          get: { $0.speed.isPresented },
+          set: { $0.speed.isPresented = $1 }
+        )
+      ) {
+        if let currentPlayer = playerManager.current {
+          FloatPickerSheet(
+            model: Binding(
+              get: { currentPlayer.speed },
+              set: { currentPlayer.speed = $0 }
+            )
+          )
+        }
+      }
+      .adaptiveSheet(
+        isPresented: miniPlayerBinding(
+          get: { $0.timer.isPresented },
+          set: { $0.timer.isPresented = $1 }
+        )
+      ) {
+        if let currentPlayer = playerManager.current {
+          TimerPickerSheet(
+            model: Binding(
+              get: { currentPlayer.timer },
+              set: { currentPlayer.timer = $0 }
+            )
+          )
+        }
+      }
+      .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+        isKeyboardVisible = true
+      }
+      .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+        isKeyboardVisible = false
+      }
+      .handleDeepLinks()
+      .onChange(of: scenePhase) { _, newPhase in
+        if newPhase == .active, preferences.openPlayerOnLaunch, playerManager.current != nil, !isModalPresented {
+          playerManager.showFullPlayer()
+        }
+      }
+  }
+
+  private func miniPlayerBinding(
+    get: @escaping (BookPlayer.Model) -> Bool,
+    set: @escaping (BookPlayer.Model, Bool) -> Void
+  ) -> Binding<Bool> {
+    Binding(
+      get: {
+        guard let current = playerManager.current, !playerManager.isShowingFullPlayer else { return false }
+        return get(current)
+      },
+      set: { newValue in
+        guard let current = playerManager.current else { return }
+        set(current, newValue)
+      }
+    )
+  }
+
+  @ViewBuilder
+  var content: some View {
+    if #available(iOS 26.0, *) {
+      modernTabView
+    } else {
+      legacyTabView
+    }
+  }
+
+  @available(iOS 26.0, *)
+  @ViewBuilder
+  private var modernTabView: some View {
+    TabView(selection: tabSelection) {
+      Tab("Home", systemImage: "house", value: .home) {
+        HomePage(model: HomePageModel())
+      }
+
+      if let current = libraries.current {
+        if current.mediaType == .podcast {
+          Tab("Latest", systemImage: "list.bullet", value: .latest) {
+            LatestView(model: latestModel)
+          }
+
+          Tab("Library", systemImage: "antenna.radiowaves.left.and.right", value: .library) {
+            PodcastsRootPage(model: podcastsModel)
+          }
+        } else {
+          Tab("Library", systemImage: "books.vertical.fill", value: .library) {
+            LibraryRootPage(model: libraryModel)
+          }
+
+          Tab("Collections", systemImage: "square.stack.3d.up.fill", value: .collections) {
+            CollectionsRootPage(model: collectionsModel)
+          }
+        }
+
+        Tab("Downloads", systemImage: "arrow.down.circle.fill", value: .downloads) {
+          DownloadsRootPage()
+        }
+
+        Tab("Search", systemImage: "magnifyingglass", value: .search, role: .search) {
+          SearchPage(model: SearchViewModel())
+        }
+      }
+    }
+    .tabBarMinimizeBehavior(.onScrollDown)
+    .tabViewSearchActivation(.searchTabSelection)
+    .tabViewBottomAccessory {
+      Group {
+        if let currentPlayer = playerManager.current {
+          MiniBookPlayer(player: currentPlayer, namespace: playerNamespace)
+            .equatable()
+            .id(currentPlayer.id)
+        } else {
+          HStack(spacing: 12) {
+            Image(systemName: "book.circle")
+              .font(.title2)
+
+            Text("Select a book to begin")
+              .font(.subheadline)
+          }
+          .frame(maxWidth: .infinity)
+          .padding()
+        }
+      }
+      .colorScheme(colorScheme)
+    }
+  }
+
+  @ViewBuilder
+  private var legacyTabView: some View {
+    TabView {
+      HomePage(model: HomePageModel())
+        .padding(.bottom, 0.5)
+        .safeAreaInset(edge: .bottom) { miniPlayer }
+        .tabItem {
+          Image(systemName: "house")
+          Text("Home")
+        }
+
+      if let current = libraries.current {
+        if current.mediaType == .podcast {
+          LatestView(model: latestModel)
+            .padding(.bottom, 0.5)
+            .safeAreaInset(edge: .bottom) { miniPlayer }
+            .tabItem {
+              Image(systemName: "clock")
+              Text("Latest")
+            }
+
+          PodcastsRootPage(model: podcastsModel)
+            .padding(.bottom, 0.5)
+            .safeAreaInset(edge: .bottom) { miniPlayer }
+            .tabItem {
+              Image(systemName: "antenna.radiowaves.left.and.right")
+              Text("Library")
+            }
+        } else {
+          LibraryRootPage(model: libraryModel)
+            .padding(.bottom, 0.5)
+            .safeAreaInset(edge: .bottom) { miniPlayer }
+            .tabItem {
+              Image(systemName: "books.vertical.fill")
+              Text("Library")
+            }
+
+          CollectionsRootPage(model: collectionsModel)
+            .padding(.bottom, 0.5)
+            .safeAreaInset(edge: .bottom) { miniPlayer }
+            .tabItem {
+              Image(systemName: "square.stack.3d.up.fill")
+              Text("Collections")
+            }
+        }
+
+        DownloadsRootPage()
+          .padding(.bottom, 0.5)
+          .safeAreaInset(edge: .bottom) { miniPlayer }
+          .tabItem {
+            Image(systemName: "arrow.down.circle.fill")
+            Text("Downloads")
+          }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var miniPlayer: some View {
+    if let currentPlayer = playerManager.current, !isKeyboardVisible {
+      LegacyMiniBookPlayer(player: currentPlayer, namespace: playerNamespace)
+        .id(currentPlayer.id)
+        .transition(.move(edge: .bottom))
+        .animation(.easeInOut(duration: 0.3), value: playerManager.hasActivePlayer)
+    }
+  }
+}
+
+extension ContentView {
+  private var isModalPresented: Bool {
+    UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .compactMap { $0.windows.first { $0.isKeyWindow } }
+      .first?
+      .rootViewController?
+      .presentedViewController != nil
+  }
+}
+
+#Preview {
+  ContentView()
+}

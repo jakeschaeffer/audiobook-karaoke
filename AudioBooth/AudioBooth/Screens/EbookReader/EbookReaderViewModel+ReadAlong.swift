@@ -1,0 +1,438 @@
+import API
+import Foundation
+import Logging
+import Models
+import ReadiumNavigator
+import ReadiumShared
+import Speech
+import UIKit
+
+extension EbookReaderViewModel {
+  private static let readAlongDecorationGroup = "readAlong"
+  private static let sentenceDecorationID = "readAlong.sentence"
+  private static let wordDecorationID = "readAlong.word"
+  private static let minimumSecondsBetweenDecorations: TimeInterval = 0.08
+  private static let minimumSecondsBetweenNavigations: TimeInterval = 0.3
+  private static let secondsAwaitingDecorationAfterJump: TimeInterval = 0.35
+  private static let secondsSettlingAfterScroll: TimeInterval = 0.4
+  private static let secondsBetweenDecorationChecks: TimeInterval = 0.1
+  private static let decorationChecksAwaitingClear = 20
+  private static let secondsBetweenDecorationAudits: TimeInterval = 2
+  private static let maximumSecondsSuspendedBeforeRestarting: TimeInterval = 300
+  private static let secondsBetweenSessionChecks: TimeInterval = 0.25
+  private static let sessionChecksBeforeReadAlong = 40
+
+  var isReadAlongSupported: Bool {
+    if let bookID, (try? LocalBook.fetch(bookID: bookID))?.hasImportedNarration == true {
+      return mediaOverlayLoad != nil
+    }
+    guard #available(iOS 26.0, *), SpeechTranscriber.isAvailable else { return false }
+    return navigator is DecorableNavigator && hasAudiobook
+  }
+
+  func catchUpToNarration() {
+    guard readAlong == nil else { return }
+
+    isCatchingUpToNarration = true
+    startReadAlong()
+
+    if readAlong == nil {
+      isCatchingUpToNarration = false
+    }
+  }
+
+  func toggleReadAlong() {
+    isCatchingUpToNarration = false
+
+    guard let readAlong else {
+      if matchingSession() == nil {
+        Task { await playAudiobookForReadAlong() }
+      } else {
+        startReadAlong()
+      }
+      return
+    }
+    readAlong.toggle()
+  }
+
+  private func playAudiobookForReadAlong() async {
+    guard let bookID,
+      let localBook = try? LocalBook.fetch(bookID: bookID),
+      NarrationSource(downloaded: localBook.tracks) != nil
+    else {
+      Toast(error: String(localized: "Download this audiobook to use Read Along.")).show()
+      return
+    }
+
+    if PlayerManager.shared.current?.id != bookID {
+      PlayerManager.shared.setCurrent(localBook)
+    }
+    PlayerManager.shared.play()
+
+    var checks = 0
+    while matchingSession() == nil, checks < Self.sessionChecksBeforeReadAlong {
+      try? await Task.sleep(for: .seconds(Self.secondsBetweenSessionChecks))
+      checks += 1
+    }
+
+    guard readAlong == nil else { return }
+    startReadAlong()
+  }
+
+  func suspendReadAlong() {
+    guard readAlong != nil || isFollowingMediaOverlay, readerSuspendedAt == nil else { return }
+
+    readerSuspendedAt = Date()
+    cancelReadAlongNavigation()
+    readAlongDecorationTask?.cancel()
+    readAlongDecorationTask = nil
+    pendingReadAlongDecorations = nil
+  }
+
+  func resumeReadAlong() {
+    guard let suspendedAt = readerSuspendedAt else { return }
+
+    readerSuspendedAt = nil
+    lastLeadingDecorationKey = nil
+
+    if isFollowingMediaOverlay {
+      mediaOverlayClipIndex = nil
+      return
+    }
+
+    guard let readAlong, !isCatchingUpToNarration else { return }
+
+    let suspendedFor = Date().timeIntervalSince(suspendedAt)
+    guard suspendedFor < Self.maximumSecondsSuspendedBeforeRestarting else {
+      AppLogger.readAlong.info("Restarting Read Along after \(Int(suspendedFor))s in the background")
+      readAlong.stop()
+      readAlong.start()
+      return
+    }
+
+    applyReadAlongDecorations(sentence: readAlong.sentenceLocator, word: readAlong.wordLocator)
+    flushReadAlongNavigation()
+  }
+
+  func tearDownReadAlong() {
+    isCatchingUpToNarration = false
+    readerSuspendedAt = nil
+    readAlong?.onActiveChanged = nil
+    readAlong?.stop()
+    readAlong = nil
+    readAlongDecorationTask?.cancel()
+    readAlongDecorationTask = nil
+    pendingReadAlongDecorations = nil
+    lastReadAlongDecorationAt = nil
+    lastLeadingDecorationKey = nil
+    lastDecorationAuditAt = nil
+    cancelReadAlongNavigation()
+    (navigator as? DecorableNavigator)?.apply(decorations: [], in: Self.readAlongDecorationGroup)
+  }
+
+  func syncReadAlongPreferences() {
+    guard !isCatchingUpToNarration else { return }
+
+    readAlong?.followsNarration = preferences.readAlongFollowsNarration
+    readAlong?.highlightsWord = preferences.readAlongHighlightsWord
+  }
+
+  private func startReadAlong() {
+    guard #available(iOS 26.0, *) else {
+      Toast(error: String(localized: "Read Along requires iOS 26 or later.")).show()
+      return
+    }
+
+    guard let publication else { return }
+
+    guard let player = PlayerManager.shared.current, matchingSession() != nil else {
+      Toast(error: String(localized: "Play this book's audiobook to use Read Along.")).show()
+      return
+    }
+
+    guard let source = narrationSource() else {
+      Toast(error: String(localized: "Download this audiobook to use Read Along.")).show()
+      return
+    }
+
+    let coordinator = ReadAlongCoordinator(
+      publication: publication,
+      source: source,
+      playhead: { [weak player] in
+        guard let player, PlayerManager.shared.current === player else { return nil }
+        return player.secondsFromStartOfBook
+      }
+    )
+
+    coordinator.followsNarration = isCatchingUpToNarration || preferences.readAlongFollowsNarration
+    coordinator.highlightsWord = preferences.readAlongHighlightsWord
+
+    coordinator.onHighlightChanged = { [weak self] sentence, word in
+      guard let self, !self.isCatchingUpToNarration else { return }
+      self.readAlongHighlightChanged(sentence: sentence, word: word)
+    }
+
+    coordinator.onFollow = { [weak self] sentence, word in
+      guard let self else { return }
+
+      guard self.isCatchingUpToNarration else {
+        self.followNarration(sentence: sentence, word: word)
+        return
+      }
+
+      Task { await self.landOnNarration(sentence) }
+    }
+
+    coordinator.onActiveChanged = { [weak self] in
+      guard let self else { return }
+      if self.readAlong?.status.isActive != true {
+        self.isCatchingUpToNarration = false
+        self.cancelReadAlongNavigation()
+      }
+      self.updateAutoScroll()
+    }
+
+    readAlong = coordinator
+    coordinator.start()
+  }
+
+  private func landOnNarration(_ sentence: Locator) async {
+    guard isCatchingUpToNarration else { return }
+
+    tearDownReadAlong()
+    updateAutoScroll()
+    catchUpMessage = nil
+    recordCatchUpAccepted()
+    await navigator?.go(to: sentence, options: NavigatorGoOptions(animated: false))
+    Haptics.impact(.medium)
+  }
+
+  func matchingSession() -> PlaybackSession? {
+    guard let bookID,
+      PlayerManager.shared.current?.id == bookID,
+      let session = SessionManager.shared.current,
+      session.libraryItemID == bookID
+    else {
+      return nil
+    }
+
+    return session
+  }
+
+  private func narrationSource() -> NarrationSource? {
+    guard let session = matchingSession() else { return nil }
+    return NarrationSource(downloaded: session.tracks)
+  }
+
+  private func readAlongHighlightChanged(sentence: Locator?, word: Locator?) {
+    if sentence == nil {
+      pendingReadAlongNavigation = nil
+    }
+
+    applyReadAlongDecorations(sentence: sentence, word: word)
+  }
+
+  func applyReadAlongDecorations(sentence: Locator?, word: Locator?) {
+    pendingReadAlongDecorations = [
+      sentence.flatMap { sentence in
+        preferences.readAlongHighlightsSentence
+          ? Decoration(id: Self.sentenceDecorationID, locator: sentence, style: .highlight(tint: .systemYellow))
+          : nil
+      },
+      word.map {
+        Decoration(id: Self.wordDecorationID, locator: $0, style: .underline(tint: .tintColor))
+      },
+    ].compactMap { $0 }
+
+    flushReadAlongDecorations()
+  }
+
+  private func flushReadAlongDecorations() {
+    guard readerSuspendedAt == nil, readAlongDecorationTask == nil else { return }
+
+    readAlongDecorationTask = Task { [weak self] in
+      while let self, let decorations = self.pendingReadAlongDecorations {
+        if let last = self.lastReadAlongDecorationAt {
+          let sinceLast = Date().timeIntervalSince(last)
+          if sinceLast < Self.minimumSecondsBetweenDecorations {
+            try? await Task.sleep(for: .seconds(Self.minimumSecondsBetweenDecorations - sinceLast))
+            continue
+          }
+        }
+
+        self.pendingReadAlongDecorations = nil
+        self.lastReadAlongDecorationAt = Date()
+        await self.applyDecorations(decorations)
+      }
+
+      self?.readAlongDecorationTask = nil
+    }
+  }
+
+  private func applyDecorations(_ decorations: [Decoration]) async {
+    guard let decorable = navigator as? DecorableNavigator else { return }
+
+    let leading = decorations.first.map { "\($0.id) \($0.locator.href.string)" }
+    if leading != lastLeadingDecorationKey {
+      await clearDecorations(using: decorable)
+      lastLeadingDecorationKey = leading
+    }
+
+    decorable.apply(decorations: decorations, in: Self.readAlongDecorationGroup)
+    await rebuildDecorationsIfDuplicated(decorations, using: decorable)
+  }
+
+  private func clearDecorations(using decorable: any DecorableNavigator) async {
+    decorable.apply(decorations: [], in: Self.readAlongDecorationGroup)
+
+    for _ in 0..<Self.decorationChecksAwaitingClear {
+      try? await Task.sleep(for: .seconds(Self.secondsBetweenDecorationChecks))
+      guard let rendered = await renderedDecorationCount(), rendered > 0 else { return }
+    }
+  }
+
+  private func rebuildDecorationsIfDuplicated(
+    _ decorations: [Decoration],
+    using decorable: any DecorableNavigator
+  ) async {
+    guard !decorations.isEmpty,
+      Date().timeIntervalSince(lastDecorationAuditAt ?? .distantPast) > Self.secondsBetweenDecorationAudits
+    else {
+      return
+    }
+
+    lastDecorationAuditAt = Date()
+    try? await Task.sleep(for: .seconds(Self.secondsBetweenDecorationChecks))
+
+    guard let rendered = await renderedDecorationCount(), rendered > decorations.count else { return }
+
+    AppLogger.readAlong.error(
+      "Rebuilding Read Along decorations: \(rendered) rendered, \(decorations.count) expected"
+    )
+    await clearDecorations(using: decorable)
+    decorable.apply(decorations: decorations, in: Self.readAlongDecorationGroup)
+  }
+
+  private func renderedDecorationCount() async -> Int? {
+    guard let navigator = navigator as? EPUBNavigatorViewController else { return nil }
+
+    let counted = await navigator.evaluateJavaScript(
+      "readium.getDecorations('\(Self.readAlongDecorationGroup)').items.length;"
+    )
+    guard case let .success(value) = counted else { return nil }
+    return (value as? NSNumber)?.intValue
+  }
+
+  func followNarration(sentence: Locator, word: Locator?) {
+    guard navigator != nil else {
+      readAlong?.narrationDidLand()
+      return
+    }
+
+    pendingReadAlongNavigation = preferences.scroll ? sentence : (word ?? sentence)
+    flushReadAlongNavigation()
+  }
+
+  private func cancelReadAlongNavigation() {
+    readAlongNavigationTask?.cancel()
+    readAlongNavigationTask = nil
+    pendingReadAlongNavigation = nil
+  }
+
+  private func flushReadAlongNavigation() {
+    guard readerSuspendedAt == nil, readAlongNavigationTask == nil else { return }
+
+    readAlongNavigationTask = Task { [weak self] in
+      while let self, !Task.isCancelled, let destination = self.pendingReadAlongNavigation {
+        self.pendingReadAlongNavigation = nil
+        await self.navigate(to: destination)
+        self.readAlong?.narrationDidLand()
+        try? await Task.sleep(for: .seconds(Self.minimumSecondsBetweenNavigations))
+      }
+
+      self?.readAlongNavigationTask = nil
+    }
+  }
+
+  private func navigate(to locator: Locator) async {
+    guard let navigator else { return }
+
+    if preferences.scroll, await scrollNarrationIntoView() { return }
+
+    await navigator.go(to: locator, options: NavigatorGoOptions(animated: false))
+
+    guard preferences.scroll else { return }
+    try? await Task.sleep(for: .seconds(Self.secondsAwaitingDecorationAfterJump))
+    _ = await scrollNarrationIntoView()
+  }
+
+  private func scrollNarrationIntoView() async -> Bool {
+    guard let scrollView = followingScrollView(), let place = await narrationPlaceOnScreen() else {
+      return false
+    }
+
+    guard let restingPlace = scrollView.restingPlace(forNarrationAt: place) else { return true }
+
+    let offset = (scrollView.contentOffset.y + place - restingPlace)
+      .clamped(to: scrollView.reachableVerticalOffsets)
+    scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x, y: offset), animated: true)
+    try? await Task.sleep(for: .seconds(Self.secondsSettlingAfterScroll))
+    return true
+  }
+
+  private func narrationPlaceOnScreen() async -> CGFloat? {
+    guard let navigator = navigator as? EPUBNavigatorViewController else { return nil }
+
+    let measurement = """
+      (function() {
+        var items = readium.getDecorations('\(Self.readAlongDecorationGroup)').items;
+        var sentence = items.find(function(each) {
+          return each.decoration.id === '\(Self.sentenceDecorationID)';
+        });
+        return sentence ? sentence.range.getBoundingClientRect().top : null;
+      })();
+      """
+
+    guard case let .success(measured) = await navigator.evaluateJavaScript(measurement),
+      let place = measured as? Double
+    else {
+      return nil
+    }
+
+    return CGFloat(place)
+  }
+
+  private func followingScrollView() -> UIScrollView? {
+    if let viewController = navigator as? UIViewController {
+      updateCurrentScrollView(in: viewController.view)
+    }
+    return currentScrollView
+  }
+}
+
+private extension UIScrollView {
+  private static let pointsBelowReadableTop: CGFloat = 12
+  private static let pointsKeptBelowNarration: CGFloat = 80
+
+  var reachableVerticalOffsets: ClosedRange<CGFloat> {
+    let topmost = -contentInset.top
+    let bottommost = contentSize.height - bounds.height + contentInset.bottom
+    return topmost...max(topmost, bottommost)
+  }
+
+  func restingPlace(forNarrationAt place: CGFloat) -> CGFloat? {
+    let readableTop = contentInset.top
+    let readableBottom = bounds.height - contentInset.bottom
+    guard place < readableTop || place > readableBottom - Self.pointsKeptBelowNarration else {
+      return nil
+    }
+
+    return readableTop + Self.pointsBelowReadableTop
+  }
+}
+
+private extension Comparable {
+  func clamped(to range: ClosedRange<Self>) -> Self {
+    min(max(self, range.lowerBound), range.upperBound)
+  }
+}

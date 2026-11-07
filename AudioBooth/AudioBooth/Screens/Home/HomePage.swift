@@ -1,0 +1,586 @@
+import API
+import Combine
+import SwiftData
+import SwiftUI
+
+struct HomePage: View {
+  @Environment(\.appTheme) var theme
+  @ObservedObject private var authentication = Audiobookshelf.shared.authentication
+  @ObservedObject private var libraries = Audiobookshelf.shared.libraries
+  @ObservedObject private var preferences = UserPreferences.shared
+  @ObservedObject private var deepLinkManager = DeepLinkManager.shared
+
+  @ScaledMetric(relativeTo: .title) private var cardWidth: CGFloat = 120
+  @ScaledMetric(relativeTo: .title) private var authorCardWidth: CGFloat = 80
+  @ScaledMetric(relativeTo: .title) private var episodeCardWidth: CGFloat = 200
+
+  private var continueSectionWidth: CGFloat {
+    preferences.continueSectionSize.value / 120 * cardWidth
+  }
+
+  private var continueEpisodeWidth: CGFloat {
+    preferences.continueSectionSize.episodeCardWidth / 200 * episodeCardWidth
+  }
+
+  private var title: Text {
+    if preferences.showUsernameGreeting,
+      let username = authentication.server?.username, !username.isEmpty
+    {
+      return Text("Hi, \(username)")
+    }
+    return Text("Home")
+  }
+
+  @StateObject var model: Model
+  @State private var showingSettings = false
+  @State private var showingServerList = false
+  @State private var showingServerDetails = false
+  @State private var showingOnboarding = false
+  @State private var didEvaluateStartupPresentation = false
+
+  var body: some View {
+    NavigationStack {
+      content
+        .navigationDestinations()
+    }
+  }
+
+  var content: some View {
+    ScrollView {
+      VStack(spacing: 24) {
+        if let error = model.error {
+          Text(error)
+            .font(.subheadline)
+            .multilineTextAlignment(.leading)
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .center)
+            .background(.red.opacity(0.3))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay {
+              RoundedRectangle(cornerRadius: 12)
+                .stroke(.red.opacity(0.5), lineWidth: 2)
+            }
+            .padding(.horizontal)
+        }
+
+        ForEach(model.sections, id: \.id) { section in
+          sectionContent(section)
+        }
+
+        if model.isLoading && model.sections.isEmpty {
+          ProgressView("Loading...")
+            .frame(maxWidth: .infinity, maxHeight: 200)
+        } else if model.sections.isEmpty && !model.isLoading {
+          emptyState
+        }
+      }
+      .padding(.bottom)
+    }
+    .background(theme.colors.background.page.ignoresSafeArea())
+    .navigationTitle(title)
+    .toolbar {
+      serverMenuToolbarItem
+
+      if #available(iOS 26.0, *) {
+        if let dailyGoal = model.dailyGoal, dailyGoal.goal > 0 {
+          ToolbarItem(placement: .topBarTrailing) {
+            let progress = min(dailyGoal.current / 60 / Double(dailyGoal.goal), 1.0)
+            NavigationLink(value: NavigationDestination.stats) {
+              Gauge(value: progress) {
+                Text(dailyGoal.goal, format: .number.precision(.fractionLength(0)))
+              } currentValueLabel: {
+                Text(dailyGoal.current / 60, format: .number.precision(.fractionLength(0)))
+                  .foregroundStyle(Color.accentColor)
+              }
+              .gaugeStyle(.accessoryCircular)
+              .tint(.accentColor)
+              .scaleEffect(0.65)
+            }
+            .tint(.primary)
+            .frame(width: 44, height: 44)
+            .glassEffect()
+          }
+          .sharedBackgroundVisibility(.hidden)
+        }
+      }
+
+      ToolbarItem(placement: .topBarTrailing) {
+        Button {
+          showingSettings = true
+        } label: {
+          Image(systemName: "gear")
+        }
+        .tint(.primary)
+      }
+    }
+    .sheet(isPresented: $showingSettings) {
+      NavigationView {
+        SettingsView(model: SettingsViewModel())
+      }
+      .displaySheetScaled()
+    }
+    .sheet(isPresented: $showingServerList) {
+      ServerListPage(model: ServerListModel())
+        .displaySheetScaled()
+    }
+    .fullScreenCover(isPresented: $showingOnboarding) {
+      OnboardingView(model: OnboardingViewModel())
+        .displayScaled()
+    }
+    .sheet(isPresented: $showingServerDetails) {
+      NavigationStack {
+        ServerView(model: ServerViewModel(server: authentication.server))
+          .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+              Button {
+                showingServerDetails = false
+              } label: {
+                Label("Close", systemImage: "xmark")
+              }
+              .tint(.primary)
+            }
+          }
+      }
+      .displaySheetScaled()
+    }
+    .onChange(of: deepLinkManager.isImportingConnection) { _, isImporting in
+      if isImporting {
+        showingOnboarding = false
+        showingServerList = false
+      }
+    }
+    .onAppear {
+      if !didEvaluateStartupPresentation {
+        didEvaluateStartupPresentation = true
+        if authentication.servers.isEmpty {
+          showingOnboarding = true
+        } else if !authentication.isAuthenticated || libraries.current == nil {
+          showingServerList = true
+        }
+      }
+      model.onAppear()
+    }
+    .onChange(of: libraries.current) { _, new in
+      showingServerList = false
+      showingServerDetails = false
+      showingOnboarding = false
+      model.onReset(new != nil)
+    }
+    .onChange(of: preferences.homeSections) { _, _ in
+      model.onPreferencesChanged()
+    }
+    .onChange(of: preferences.dailyGoalMinutes) { _, _ in
+      model.onPreferencesChanged()
+    }
+    .refreshable {
+      await model.refresh()
+    }
+  }
+
+  private var emptyState: some View {
+    VStack(spacing: 16) {
+      Image(systemName: authentication.servers.isEmpty ? "server.rack" : "headphones")
+        .font(.system(size: 60))
+        .foregroundColor(.gray.opacity(0.6))
+
+      if authentication.servers.isEmpty {
+        Text("No Server Connected")
+          .font(.title2)
+          .fontWeight(.medium)
+          .foregroundColor(.primary)
+
+        Text(
+          "AudioBooth plays the audiobooks and podcasts on your Audiobookshelf server. Connect one to start listening."
+        )
+        .font(.body)
+        .foregroundColor(.secondary)
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 32)
+
+        Button {
+          showingServerDetails = true
+        } label: {
+          Text("Connect a Server")
+            .font(.headline)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+      } else {
+        Text("No Content Available")
+          .font(.title2)
+          .fontWeight(.medium)
+          .foregroundColor(.primary)
+
+        Text("Your personalized content will appear here")
+          .font(.body)
+          .foregroundColor(.secondary)
+          .multilineTextAlignment(.center)
+          .padding(.horizontal, 32)
+      }
+
+      Spacer()
+    }
+    .padding()
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  @ViewBuilder
+  private func sectionContent(_ section: HomePage.Model.Section) -> some View {
+    VStack(alignment: .leading, spacing: 12) {
+      switch section.items {
+      case .stats:
+        ListeningStatsCard(model: ListeningStatsCardModel())
+          .padding(.horizontal)
+
+      case .playlist(let id, let items):
+        NavigationLink(value: NavigationDestination.playlist(id: id)) {
+          HStack {
+            Text(section.title)
+              .font(.title2)
+              .fontWeight(.semibold)
+              .foregroundColor(.primary)
+              .accessibilityAddTraits(.isHeader)
+
+            Spacer()
+
+            Image(systemName: "chevron.right")
+              .font(.body)
+              .foregroundColor(.secondary)
+          }
+          .padding(.horizontal)
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(alignment: .top, spacing: 16) {
+            ForEach(items) { item in
+              switch item {
+              case .book(let model):
+                BookCard(model: model)
+              case .episode(let model):
+                EpisodeCard(model: model)
+              }
+            }
+          }
+          .padding(.horizontal)
+        }
+        .environment(\.coverSize, cardWidth)
+
+      case .continueBooks(let model):
+        Text(section.title)
+          .font(.title2)
+          .fontWeight(.semibold)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal)
+          .accessibilityAddTraits(.isHeader)
+
+        switch preferences.continueListeningStyle {
+        case .carousel:
+          ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: 16) {
+              ForEach(model.items, id: \.id) { item in
+                BookCard(model: item)
+              }
+            }
+            .padding(.horizontal)
+          }
+          .environment(\.coverSize, continueSectionWidth)
+
+        case .coverFlow:
+          ContinueListeningCoverFlowView(model: model)
+        }
+
+      case .books(let items):
+        Text(section.title)
+          .font(.title2)
+          .fontWeight(.semibold)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal)
+          .accessibilityAddTraits(.isHeader)
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(alignment: .top, spacing: 16) {
+            ForEach(items, id: \.id) { book in
+              BookCard(model: book)
+            }
+          }
+          .padding(.horizontal)
+        }
+        .environment(\.coverSize, cardWidth)
+
+      case .episodes(let items):
+        Text(section.title)
+          .font(.title2)
+          .fontWeight(.semibold)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal)
+          .accessibilityAddTraits(.isHeader)
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          LazyHStack(alignment: .top, spacing: 16) {
+            ForEach(items) { episode in
+              EpisodeCard(model: episode)
+            }
+          }
+          .padding(.horizontal)
+        }
+        .environment(\.episodeCardWidth, section.id == "continue-listening" ? continueEpisodeWidth : nil)
+
+      case .series(let items):
+        Text(section.title)
+          .font(.title2)
+          .fontWeight(.semibold)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal)
+          .accessibilityAddTraits(.isHeader)
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(alignment: .top, spacing: 16) {
+            ForEach(items) { series in
+              SeriesCard(model: series)
+            }
+          }
+          .padding(.horizontal)
+        }
+        .environment(\.itemDisplayMode, .card)
+        .environment(\.coverSize, cardWidth)
+
+      case .authors(let items):
+        Text(section.title)
+          .font(.title2)
+          .fontWeight(.semibold)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal)
+          .accessibilityAddTraits(.isHeader)
+
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(alignment: .top, spacing: 16) {
+            ForEach(items, id: \.id) { author in
+              AuthorCard(model: author)
+                .frame(width: authorCardWidth)
+            }
+          }
+          .padding(.horizontal)
+        }
+      }
+    }
+  }
+}
+
+extension HomePage {
+  var connectionStatusColor: Color {
+    switch authentication.server?.status {
+    case .connected:
+      return .green
+    case .connectionError:
+      return .orange
+    case .authenticationError:
+      return .red
+    case .none:
+      return .gray
+    }
+  }
+
+  var connectionStatusLabel: LocalizedStringResource {
+    switch authentication.server?.status {
+    case .connected: "Connected"
+    case .connectionError: "Connection error"
+    case .authenticationError: "Authentication error"
+    case .none: "Disconnected"
+    }
+  }
+
+  var serverMenuToolbarItem: some ToolbarContent {
+    ToolbarItem(placement: .topBarLeading) {
+      Menu {
+        if authentication.isAuthenticated {
+          ForEach(model.availableLibraries) { library in
+            if library.id == libraries.current?.id {
+              Button {
+                model.onLibrarySelected(library.id)
+              } label: {
+                Label(library.name, systemImage: "checkmark")
+              }
+            } else {
+              Button {
+                model.onLibrarySelected(library.id)
+              } label: {
+                Text(library.name)
+              }
+            }
+          }
+
+          if let server = authentication.server, server.alternativeURL != nil {
+            ControlGroup("Server URL") {
+              Button("Primary", systemImage: server.isUsingAlternativeURL ? "circle" : "checkmark.circle.fill") {
+                if server.isUsingAlternativeURL {
+                  model.onToggleAlternativeURL()
+                }
+              }
+              .tint(server.isUsingAlternativeURL ? nil : .accentColor)
+
+              Button("Alternative", systemImage: server.isUsingAlternativeURL ? "checkmark.circle.fill" : "circle") {
+                if !server.isUsingAlternativeURL {
+                  model.onToggleAlternativeURL()
+                }
+              }
+              .tint(server.isUsingAlternativeURL ? .accentColor : nil)
+            }
+          }
+
+          if !model.availableLibraries.isEmpty {
+            Divider()
+          }
+
+          Button {
+            showingServerDetails = true
+          } label: {
+            Label("Server Details", systemImage: "info.circle")
+          }
+        }
+
+        Button {
+          showingServerList = true
+        } label: {
+          Label("Manage Servers", systemImage: "server.rack")
+        }
+      } label: {
+        HStack(spacing: 4) {
+          #if !targetEnvironment(macCatalyst)
+          Text(verbatim: "●")
+            .foregroundStyle(connectionStatusColor)
+          #endif
+          Text(libraries.current?.name ?? "Server")
+            .bold()
+        }
+        .frame(maxWidth: 250)
+      }
+      .accessibilityLabel("Server: \(libraries.current?.name ?? "Server"), \(connectionStatusLabel)")
+      .tint(.primary)
+    }
+  }
+}
+
+extension HomePage {
+  @Observable
+  class Model: ObservableObject {
+    var isLoading: Bool
+    var isRoot: Bool
+
+    var error: String?
+
+    struct LibraryItem: Identifiable {
+      let id: String
+      let name: String
+    }
+
+    struct Section {
+      let id: String
+      let title: String
+
+      enum Items {
+        case stats
+        case continueBooks(ContinueListeningCoverFlowView.Model)
+        case playlist(id: String, items: [PlaylistItem])
+        case books([BookCard.Model])
+        case episodes([EpisodeCard.Model])
+        case series([SeriesCard.Model])
+        case authors([AuthorCard.Model])
+      }
+      let items: Items
+
+      enum PlaylistItem: Identifiable {
+        case book(BookCard.Model)
+        case episode(EpisodeCard.Model)
+
+        var id: String {
+          switch self {
+          case .book(let model): model.id
+          case .episode(let model): model.id
+          }
+        }
+      }
+
+      init(id: String, title: String, items: Items) {
+        self.id = id
+        self.title = title
+        self.items = items
+      }
+    }
+
+    var sections: [Section]
+    var dailyGoal: (current: Double, goal: Int)?
+    var availableLibraries: [LibraryItem]
+
+    func onAppear() {}
+    func refresh() async {}
+    func onReset(_ shouldRefresh: Bool) {}
+    func onPreferencesChanged() {}
+    func onLibrarySelected(_ id: String) {}
+    func onToggleAlternativeURL() {}
+
+    init(
+      isLoading: Bool = false,
+      isRoot: Bool = true,
+      error: String? = nil,
+      sections: [Section] = [],
+      dailyGoal: (current: Double, goal: Int)? = nil,
+      availableLibraries: [LibraryItem] = []
+    ) {
+      self.isLoading = isLoading
+      self.isRoot = isRoot
+      self.error = error
+      self.sections = sections
+      self.dailyGoal = dailyGoal
+      self.availableLibraries = availableLibraries
+    }
+  }
+}
+
+extension HomePage.Model {
+  static var mock: HomePage.Model {
+    let books: [BookCard.Model] = [
+      BookCard.Model(
+        title: "The Lord of the Rings",
+        details: "8hr 32min remaining",
+        cover: Cover.Model(
+          url: URL(string: "https://m.media-amazon.com/images/I/51YHc7SK5HL._SL500_.jpg"),
+          progress: 0.45
+        )
+      ),
+      BookCard.Model(
+        title: "Dune",
+        details: "2hr 15min remaining",
+        cover: Cover.Model(
+          url: URL(string: "https://m.media-amazon.com/images/I/41rrXYM-wHL._SL500_.jpg"),
+          progress: 0.12
+        )
+      ),
+    ]
+
+    return HomePage.Model(
+      error:
+        "Some features may be limited on server version 2.20.0. For the best experience, please update your server.",
+      sections: [
+        Section(
+          id: "continue-listening",
+          title: "Continue Listening",
+          items: .continueBooks(.init(items: books))
+        )
+      ]
+    )
+  }
+}
+
+#Preview("HomePage - Loading") {
+  HomePage(model: .init(isLoading: true))
+}
+
+#Preview("HomePage - Empty") {
+  HomePage(model: .init())
+}
+
+#Preview("HomePage - With Continue Listening") {
+  HomePage(model: .mock)
+}

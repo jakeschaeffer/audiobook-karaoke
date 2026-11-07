@@ -1,0 +1,1067 @@
+import API
+import Combine
+import NukeUI
+import RichText
+import SwiftUI
+
+struct PodcastDetailsView: View {
+  @Environment(\.appTheme) var theme
+
+  private let audiobookshelf = Audiobookshelf.shared
+
+  @StateObject var model: Model
+
+  @State private var isDescriptionExpanded = false
+  @State private var isShowingFullScreenCover = false
+  @State private var layoutSize: CGSize?
+
+  private enum CoordinateSpaces {
+    case scrollView
+  }
+
+  var body: some View {
+    GeometryReader { proxy in
+      let size = layoutSize ?? proxy.size
+      if size.width > size.height, size.width >= 700 {
+        landscapeLayout(coverWidth: proxy.leadingPanelWidth ?? 300)
+      } else {
+        portraitLayout
+      }
+    }
+    .background {
+      GeometryReader { proxy in
+        Color.clear
+          .onChange(of: proxy.size, initial: true) { _, size in
+            layoutSize = size
+          }
+      }
+      .ignoresSafeArea(.keyboard)
+    }
+    .background(theme.colors.background.page.ignoresSafeArea())
+    .fullScreenCover(isPresented: $isShowingFullScreenCover) {
+      if let coverURL = model.coverURL {
+        FullScreenCoverView(coverURL: coverURL)
+      }
+    }
+    .overlay {
+      if model.isLoading {
+        ProgressView("Loading podcast details...")
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .background(theme.colors.background.page.ignoresSafeArea())
+      } else if let error = model.error {
+        ContentUnavailableView {
+          Label("Unable to Load Podcast", systemImage: "exclamationmark.triangle")
+        } description: {
+          Text(error)
+        } actions: {
+          Button("Try Again") {
+            model.onAppear()
+          }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(theme.colors.background.page.ignoresSafeArea())
+      }
+    }
+    .toolbar {
+      ToolbarItem(placement: .topBarTrailing) {
+        autoQueueMenu
+      }
+
+      if #available(iOS 26.0, *) {
+        ToolbarSpacer(.fixed, placement: .topBarTrailing)
+      }
+
+      if let feedURL = model.feedURL,
+        let userType = audiobookshelf.authentication.server?.userType,
+        [.root, .admin].contains(userType)
+      {
+        ToolbarItem(placement: .topBarTrailing) {
+          NavigationLink(
+            value: NavigationDestination.podcastFeed(
+              podcastID: model.podcastID,
+              podcastTitle: model.title,
+              coverURL: model.coverURL,
+              feedURL: feedURL
+            )
+          ) {
+            Label("Find Episodes", systemImage: "plus.magnifyingglass")
+          }
+          .tint(.primary)
+        }
+
+        if #available(iOS 26.0, *) {
+          ToolbarSpacer(.fixed, placement: .topBarTrailing)
+        }
+      }
+
+      if audiobookshelf.authentication.server?.permissions?.download == true {
+        ToolbarItem(placement: .topBarTrailing) {
+          ConfirmationButton(
+            confirmation: .init(
+              title: "Download \(model.selectedFilter.title)?",
+              message: "This will download \(model.filteredEpisodes.count) episodes.",
+              action: "Download"
+            ),
+            action: model.onDownloadAllEpisodes
+          ) {
+            Label("Download All", systemImage: "arrow.down.circle")
+          }
+          .tint(.primary)
+        }
+      }
+    }
+    .onAppear(perform: model.onAppear)
+  }
+
+  private var autoQueueMenu: some View {
+    Menu {
+      Section("Auto-Add New Episodes") {
+        Button {
+          model.onAutoQueueChanged(.off, model.autoQueueLimit)
+        } label: {
+          if model.autoQueuePosition == .off {
+            Label("Off", systemImage: "checkmark")
+          } else {
+            Text("Off")
+          }
+        }
+
+        autoQueuePositionMenu(.top)
+        autoQueuePositionMenu(.bottom)
+      }
+    } label: {
+      Label("Auto-Add New Episodes", systemImage: "text.badge.plus")
+    }
+    .tint(.primary)
+  }
+
+  private func autoQueuePositionMenu(_ position: PodcastAutoQueueSettings.Position) -> some View {
+    Menu {
+      ForEach(PodcastAutoQueueLimit.allCases) { limit in
+        Button {
+          model.onAutoQueueChanged(position, limit)
+        } label: {
+          if model.autoQueuePosition == position && model.autoQueueLimit == limit {
+            Label {
+              Text(limit.title)
+            } icon: {
+              Image(systemName: "checkmark")
+            }
+          } else {
+            Text(limit.title)
+          }
+        }
+      }
+    } label: {
+      if model.autoQueuePosition == position {
+        Label {
+          Text(position.title)
+        } icon: {
+          Image(systemName: "checkmark")
+        }
+        Text(model.autoQueueLimit.title)
+      } else {
+        Text(position.title)
+      }
+    }
+  }
+
+  private func scrollToEpisode(id: String?, proxy: ScrollViewProxy) {
+    guard let id else { return }
+    Task {
+      try? await Task.sleep(for: .milliseconds(300))
+      withAnimation {
+        proxy.scrollTo(id, anchor: .center)
+      }
+      try? await Task.sleep(for: .milliseconds(400))
+      withAnimation { model.highlightedEpisodeID = id }
+      model.scrollToEpisodeID = nil
+    }
+  }
+
+  private var portraitLayout: some View {
+    GeometryReader { proxy in
+      ScrollViewReader { scrollProxy in
+        ScrollView {
+          VStack(spacing: 0) {
+            cover(offset: proxy.safeAreaInsets.top)
+              .frame(height: 266 + proxy.safeAreaInsets.top)
+
+            contentSections
+              .padding(.vertical)
+              .background(theme.colors.background.page.ignoresSafeArea())
+          }
+          .padding(.vertical)
+        }
+        .coordinateSpace(name: CoordinateSpaces.scrollView)
+        .ignoresSafeArea(edges: .top)
+        .onChange(of: model.scrollToEpisodeID) { _, id in
+          scrollToEpisode(id: id, proxy: scrollProxy)
+        }
+      }
+    }
+  }
+
+  private func landscapeLayout(coverWidth: CGFloat) -> some View {
+    HStack(spacing: 0) {
+      simpleCover(width: coverWidth)
+
+      ScrollViewReader { scrollProxy in
+        ScrollView {
+          contentSections
+            .padding(.vertical)
+        }
+        .background(theme.colors.background.page.ignoresSafeArea())
+        .onChange(of: model.scrollToEpisodeID) { _, id in
+          scrollToEpisode(id: id, proxy: scrollProxy)
+        }
+      }
+    }
+  }
+
+  private var contentSections: some View {
+    VStack(spacing: 16) {
+      VStack(spacing: 16) {
+        title
+
+        metadataSection
+
+        if let description = model.description {
+          descriptionSection(description)
+        }
+        if let genres = model.genres, !genres.isEmpty {
+          genresSection(genres)
+        }
+        if let tags = model.tags, !tags.isEmpty {
+          tagsSection(tags)
+        }
+      }
+      .padding(.horizontal)
+
+      episodesSection
+    }
+  }
+
+  private var title: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack(alignment: .firstTextBaseline) {
+        Text(model.title)
+          .font(.title)
+          .fontWeight(.bold)
+
+        if model.isExplicit {
+          Image(systemName: "e.square.fill")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      if let author = model.author {
+        Text(author)
+          .font(.title3)
+          .foregroundStyle(.secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+    }
+  }
+
+  private var metadataSection: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Metadata")
+        .font(.headline)
+
+      VStack(alignment: .leading, spacing: 8) {
+        if let language = model.language {
+          HStack {
+            Image(systemName: "globe")
+              .accessibilityHidden(true)
+            Text("**Language:** \(language)")
+          }
+          .font(.subheadline)
+        }
+
+        if !model.episodesLoading {
+          HStack {
+            Image(systemName: "mic")
+              .accessibilityHidden(true)
+            Text("**Episodes:** \(model.episodeCount)")
+          }
+          .font(.subheadline)
+        }
+
+        if let podcastType = model.podcastType {
+          HStack {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+              .accessibilityHidden(true)
+            Text("**Type:** \(podcastType.capitalized)")
+          }
+          .font(.subheadline)
+        }
+
+        if let durationText = model.durationText {
+          HStack {
+            Image(systemName: "clock")
+              .accessibilityHidden(true)
+            Text("**Duration:** \(durationText)")
+          }
+          .font(.subheadline)
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private func cover(offset: CGFloat) -> some View {
+    ParallaxHeader(coordinateSpace: CoordinateSpaces.scrollView) {
+      Cover(
+        model: Cover.Model(
+          url: model.coverURL,
+          title: model.title,
+          author: model.author
+        ),
+        style: .plain
+      )
+      .shadow(radius: 4)
+      .frame(width: 250, height: 250)
+      .offset(y: offset / 2 - 8)
+      .onTapGesture {
+        guard model.coverURL != nil else { return }
+        isShowingFullScreenCover = true
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .background {
+        LazyImage(url: model.coverURL) { state in
+          state.image?
+            .resizable()
+            .aspectRatio(contentMode: .fill)
+            .blur(radius: 5)
+            .opacity(0.3)
+        }
+      }
+    }
+  }
+
+  private func simpleCover(width: CGFloat) -> some View {
+    VStack {
+      Cover(
+        model: Cover.Model(
+          url: model.coverURL,
+          title: model.title,
+          author: model.author
+        ),
+        style: .plain
+      )
+      .aspectRatio(1, contentMode: .fit)
+      .frame(maxWidth: width * 2 / 3, maxHeight: width * 2 / 3)
+      .shadow(radius: 4)
+      .padding()
+      .onTapGesture {
+        guard model.coverURL != nil else { return }
+        isShowingFullScreenCover = true
+      }
+    }
+    .frame(width: width)
+    .frame(maxHeight: .infinity)
+    .background {
+      LazyImage(url: model.coverURL) { state in
+        state.image?
+          .resizable()
+          .scaledToFill()
+          .blur(radius: 5)
+          .opacity(0.3)
+      }
+    }
+    .ignoresSafeArea(edges: .vertical)
+  }
+
+  private func genresSection(_ genres: [String]) -> some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Genres")
+        .font(.headline)
+
+      FlowLayout(spacing: 4) {
+        ForEach(genres, id: \.self) { genre in
+          NavigationLink(value: NavigationDestination.genre(name: genre, libraryID: model.libraryID)) {
+            Chip(
+              title: genre,
+              icon: "theatermasks.fill",
+              color: .gray
+            )
+          }
+          .disabled(model.libraryID == nil)
+        }
+      }
+    }
+  }
+
+  private func tagsSection(_ tags: [String]) -> some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Tags")
+        .font(.headline)
+
+      FlowLayout(spacing: 4) {
+        ForEach(tags, id: \.self) { tag in
+          NavigationLink(value: NavigationDestination.tag(name: tag, libraryID: model.libraryID)) {
+            Chip(
+              title: tag,
+              icon: "tag.fill",
+              color: .gray
+            )
+          }
+          .disabled(model.libraryID == nil)
+        }
+      }
+    }
+  }
+
+  private func descriptionSection(_ description: String) -> some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Description")
+        .font(.headline)
+
+      ZStack(alignment: .bottom) {
+        RichText(
+          html: description,
+          configuration: Configuration(
+            customCSS: "body { font: -apple-system-subheadline; }"
+          )
+        )
+        .frame(maxHeight: isDescriptionExpanded ? nil : 180, alignment: .top)
+        .contentShape(Rectangle())
+        .clipped()
+        .allowsHitTesting(false)
+
+        if !isDescriptionExpanded {
+          LinearGradient(
+            colors: [.clear, theme.colors.background.page],
+            startPoint: .top,
+            endPoint: .bottom
+          )
+          .frame(height: 60)
+          .accessibilityHidden(true)
+        }
+      }
+    }
+    .contentShape(Rectangle())
+    .onTapGesture {
+      withAnimation(.easeInOut(duration: 0.25)) {
+        isDescriptionExpanded.toggle()
+      }
+    }
+    .textSelection(.enabled)
+  }
+
+  // MARK: - Episodes
+
+  private var episodesSection: some View {
+    Group {
+      if model.episodesLoading {
+        HStack {
+          Spacer()
+          ProgressView("Loading episodes...")
+            .padding(.vertical, 40)
+          Spacer()
+        }
+      } else {
+        episodesContent
+      }
+    }
+  }
+
+  private var episodesContent: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack {
+        Text(model.episodesTitle)
+          .font(.headline)
+        Spacer()
+        Button {
+          model.onPlayAllEpisodes()
+        } label: {
+          Label("Play", systemImage: "play.fill")
+            .font(.caption)
+            .fontWeight(.medium)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .foregroundStyle(Color.accentColor)
+            .background(Color.accentColor.opacity(0.15))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(model.filteredEpisodes.allSatisfy(\.isCompleted))
+      }
+      .padding(.horizontal)
+
+      HStack {
+        Picker("Filter", selection: Binding(get: { model.selectedFilter }, set: { model.onFilterChanged($0) })) {
+          ForEach(Model.EpisodeFilter.allCases, id: \.self) { filter in
+            Text(filter.title).tag(filter)
+          }
+        }
+        .pickerStyle(.menu)
+
+        Spacer()
+
+        Menu {
+          ForEach(Model.EpisodeSort.allCases, id: \.self) { sort in
+            Button {
+              model.onSortOptionTapped(sort)
+            } label: {
+              if model.selectedSort == sort {
+                Label(
+                  sort.title,
+                  systemImage: model.ascending ? "chevron.up" : "chevron.down"
+                )
+              } else {
+                Text(sort.title)
+              }
+            }
+          }
+        } label: {
+          Label(
+            model.selectedSort.title,
+            systemImage: model.ascending ? "chevron.up" : "chevron.down"
+          )
+          .font(.subheadline)
+        }
+      }
+      .padding(.horizontal)
+
+      TextField("Search episodes", text: $model.searchText)
+        .textFieldStyle(.roundedBorder)
+        .padding(.horizontal)
+
+      LazyVStack(spacing: 0) {
+        ForEach(model.filteredEpisodes) { episode in
+          let selector = episode.contextMenu?.collectionSelector
+
+          NavigationLink {
+            PodcastEpisodeDetailView(
+              model: PodcastEpisodeDetailViewModel(
+                podcastID: model.podcastID,
+                podcastTitle: model.title,
+                podcastAuthor: model.author,
+                coverURL: model.coverURL,
+                episode: episode
+              )
+            )
+          } label: {
+            episodeRow(episode)
+              .padding(.horizontal)
+          }
+          .buttonStyle(.plain)
+          .contextMenu {
+            if let contextMenu = episode.contextMenu {
+              PodcastEpisodeContextMenu(model: contextMenu)
+            }
+          }
+          .menuOrder(.priority)
+          .podcastEpisodeAccessibilityActions(
+            episodeID: episode.id,
+            menu: episode.contextMenu
+          )
+          .sheet(
+            item: Binding(
+              get: { selector },
+              set: { episode.contextMenu?.collectionSelector = $0 }
+            )
+          ) { sheetModel in
+            CollectionSelectorSheet(model: sheetModel)
+          }
+          .background(
+            episode.id == model.highlightedEpisodeID
+              ? Color.accentColor.opacity(0.15)
+              : Color.clear
+          )
+          .clipShape(RoundedRectangle(cornerRadius: 8))
+          .id(episode.id)
+          Divider()
+        }
+      }
+    }
+  }
+
+  private func episodeRow(_ episode: Model.Episode) -> some View {
+    HStack(spacing: 12) {
+      VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 6) {
+          if let season = episode.season, !season.isEmpty, let ep = episode.episode, !ep.isEmpty {
+            Text("S\(season)E\(ep)")
+              .font(.caption2)
+              .fontWeight(.medium)
+              .foregroundStyle(.secondary)
+          } else if let ep = episode.episode, !ep.isEmpty {
+            Text("E\(ep)")
+              .font(.caption2)
+              .fontWeight(.medium)
+              .foregroundStyle(.secondary)
+          }
+
+          Text(episode.title)
+            .font(.subheadline)
+            .fontWeight(.medium)
+            .lineLimit(2)
+            .multilineTextAlignment(.leading)
+        }
+
+        if let publishedAt = episode.publishedAt {
+          Text(publishedAt.formatted(date: .abbreviated, time: .omitted))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+
+        if let summary = episode.summary, !summary.isEmpty {
+          Text(summary)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
+            .multilineTextAlignment(.leading)
+        }
+
+        HStack(spacing: 8) {
+          episodePlayButton(episode)
+
+          if episode.downloadState == .downloaded {
+            Image(systemName: "arrow.down.circle.fill")
+              .font(.title3)
+              .foregroundStyle(.green)
+              .accessibilityLabel("Downloaded")
+          }
+        }
+
+        if episode.progress > 0 {
+          ProgressView(value: min(episode.progress, 1.0))
+            .tint(.accentColor)
+        }
+      }
+
+      Spacer(minLength: 0)
+
+      Image(systemName: "chevron.right")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+    .padding(.vertical, 10)
+    .contentShape(Rectangle())
+  }
+
+  private func episodePlayButton(_ episode: Model.Episode) -> some View {
+    let isCurrentEpisode = episode.id == model.currentlyPlayingEpisodeID
+    let isCurrentlyPlaying = isCurrentEpisode && model.isPlaying
+
+    return Button {
+      model.onPlayEpisode(episode)
+    } label: {
+      Label {
+        Text(episodePlayButtonText(for: episode, isCurrentlyPlaying: isCurrentlyPlaying))
+      } icon: {
+        Image(systemName: isCurrentlyPlaying ? "pause.fill" : "play.fill")
+      }
+      .font(.caption)
+      .fontWeight(.medium)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .foregroundStyle(isCurrentlyPlaying ? .white : Color.accentColor)
+      .background(isCurrentlyPlaying ? Color.accentColor : Color.accentColor.opacity(0.15))
+      .clipShape(Capsule())
+    }
+    .buttonStyle(.plain)
+    .accessibilityLabel(isCurrentlyPlaying ? "Pause" : "Play")
+    .accessibilityValue(
+      episodePlayButtonAccessibilityValue(for: episode, isCurrentlyPlaying: isCurrentlyPlaying)
+    )
+  }
+
+  private func episodePlayButtonText(
+    for episode: Model.Episode,
+    isCurrentlyPlaying: Bool
+  ) -> String {
+    if isCurrentlyPlaying {
+      return "Pause"
+    }
+    if episode.isCompleted {
+      return "Played"
+    }
+    guard let duration = episode.duration, duration > 0 else {
+      return "Play"
+    }
+    let seconds: Double
+    if episode.progress > 0 {
+      seconds = duration * (1 - episode.progress)
+    } else {
+      seconds = duration
+    }
+    let text = Duration.seconds(seconds).formatted(
+      .units(allowed: [.hours, .minutes], width: .narrow)
+    )
+    if episode.progress > 0 {
+      return "\(text) left"
+    }
+    return text
+  }
+
+  private func episodePlayButtonAccessibilityValue(
+    for episode: Model.Episode,
+    isCurrentlyPlaying: Bool
+  ) -> String {
+    if isCurrentlyPlaying {
+      return ""
+    }
+    if episode.isCompleted {
+      return String(localized: "Played")
+    }
+    guard let duration = episode.duration, duration > 0 else {
+      return ""
+    }
+    if episode.progress > 0 {
+      return (duration * (1 - episode.progress)).accessibilityTimeRemaining
+    }
+    return Duration.seconds(duration).formatted(
+      .units(allowed: [.hours, .minutes], width: .wide)
+    )
+  }
+
+}
+
+// MARK: - Model
+
+extension PodcastDetailsView {
+  @Observable
+  class Model: ObservableObject {
+    let podcastID: String
+    var libraryID: String?
+    var title: String
+    var author: String?
+    var coverURL: URL?
+    var description: String?
+    var genres: [String]?
+    var tags: [String]?
+    var isLoading: Bool
+    var episodesLoading: Bool = false
+    var error: String?
+    var isExplicit: Bool
+    var language: String?
+    var podcastType: String?
+    var durationText: String?
+    var episodeCount: Int
+    var feedURL: String?
+
+    var episodes: [Episode]
+    var searchText: String
+    var selectedFilter: EpisodeFilter
+    var selectedSort: EpisodeSort
+    var ascending: Bool
+
+    var currentlyPlayingEpisodeID: String?
+    var isPlaying: Bool
+
+    var autoQueuePosition: PodcastAutoQueueSettings.Position = .off
+    var autoQueueLimit: PodcastAutoQueueLimit = .all
+
+    var scrollToEpisodeID: String?
+    var highlightedEpisodeID: String?
+
+    var episodesTitle: String {
+      let filtered = filteredEpisodes.count
+      let total = episodes.count
+      if searchText.isEmpty && selectedFilter == .all {
+        return "\(total) Episodes"
+      } else {
+        return "\(filtered)/\(total) Episodes"
+      }
+    }
+
+    var filteredEpisodes: [Episode] {
+      var result = episodes
+
+      if !searchText.isEmpty {
+        let query = searchText.lowercased()
+        result = result.filter {
+          $0.title.lowercased().contains(query)
+            || ($0.description?.lowercased().contains(query) ?? false)
+        }
+      }
+
+      switch selectedFilter {
+      case .all:
+        break
+      case .incomplete:
+        result = result.filter { !$0.isCompleted }
+      case .complete:
+        result = result.filter { $0.isCompleted }
+      case .inProgress:
+        result = result.filter { $0.progress > 0 && !$0.isCompleted }
+      }
+
+      result.sort { selectedSort.areInOrder($0, $1, ascending: ascending) }
+
+      return result
+    }
+
+    func onAppear() {}
+    func onPlayEpisode(_ episode: Episode) {}
+    func onPlayAllEpisodes() {}
+    func onDownloadAllEpisodes() {}
+    func onAutoQueueChanged(_ position: PodcastAutoQueueSettings.Position, _ limit: PodcastAutoQueueLimit) {}
+    func onFilterChanged(_ filter: EpisodeFilter) {}
+    func onSortOptionTapped(_ sort: EpisodeSort) {
+      if selectedSort == sort {
+        ascending.toggle()
+      } else {
+        selectedSort = sort
+        ascending = false
+      }
+    }
+
+    init(
+      podcastID: String,
+      title: String = "",
+      author: String? = nil,
+      coverURL: URL? = nil,
+      description: String? = nil,
+      genres: [String]? = nil,
+      tags: [String]? = nil,
+      isLoading: Bool = true,
+      error: String? = nil,
+      isExplicit: Bool = false,
+      language: String? = nil,
+      podcastType: String? = nil,
+      durationText: String? = nil,
+      episodeCount: Int = 0,
+      episodes: [Episode] = [],
+      searchText: String = "",
+      selectedFilter: EpisodeFilter = .all,
+      selectedSort: EpisodeSort = .pubDate,
+      ascending: Bool = false,
+      currentlyPlayingEpisodeID: String? = nil,
+      isPlaying: Bool = false
+    ) {
+      self.podcastID = podcastID
+      self.title = title
+      self.author = author
+      self.coverURL = coverURL
+      self.description = description
+      self.genres = genres
+      self.tags = tags
+      self.isLoading = isLoading
+      self.error = error
+      self.isExplicit = isExplicit
+      self.language = language
+      self.podcastType = podcastType
+      self.durationText = durationText
+      self.episodeCount = episodeCount
+      self.episodes = episodes
+      self.searchText = searchText
+      self.selectedFilter = selectedFilter
+      self.selectedSort = selectedSort
+      self.ascending = ascending
+      self.currentlyPlayingEpisodeID = currentlyPlayingEpisodeID
+      self.isPlaying = isPlaying
+    }
+  }
+}
+
+// MARK: - Episode
+
+extension PodcastDetailsView.Model {
+  struct Episode: Identifiable {
+    let id: String
+    let title: String
+    let season: String?
+    let episode: String?
+    let publishedAt: Date?
+    let duration: Double?
+    let size: Int64?
+    let description: String?
+    var summary: String? = nil
+    var isCompleted: Bool
+    var progress: Double
+    let chapters: [Chapter]
+    var downloadState: DownloadManager.DownloadState
+    var contextMenu: PodcastEpisodeContextMenu.Model?
+    var apiEpisode: PodcastEpisode?
+
+    var durationText: String? {
+      guard let duration, duration > 0 else { return nil }
+      return Duration.seconds(duration).formatted(
+        .units(
+          allowed: [.hours, .minutes],
+          width: .narrow
+        )
+      )
+    }
+  }
+
+  struct Chapter: Identifiable {
+    let id: Int
+    let start: Double
+    let end: Double
+    let title: String
+
+    var durationText: String {
+      Duration.seconds(end - start).formatted(
+        .units(
+          allowed: [.hours, .minutes, .seconds],
+          width: .narrow
+        )
+      )
+    }
+
+    var startText: String {
+      Duration.seconds(start).formatted(
+        .units(
+          allowed: [.hours, .minutes, .seconds],
+          width: .narrow
+        )
+      )
+    }
+  }
+}
+
+// MARK: - Enums
+
+extension PodcastDetailsView.Model {
+  enum EpisodeFilter: String, CaseIterable {
+    case all, incomplete, complete, inProgress
+
+    var title: LocalizedStringResource {
+      switch self {
+      case .all: "All"
+      case .incomplete: "Incomplete"
+      case .complete: "Complete"
+      case .inProgress: "In Progress"
+      }
+    }
+  }
+
+  enum EpisodeSort: String, CaseIterable {
+    case pubDate, title, season, episode
+
+    var title: LocalizedStringResource {
+      switch self {
+      case .pubDate: "Pub Date"
+      case .title: "Title"
+      case .season: "Season"
+      case .episode: "Episode"
+      }
+    }
+
+    func areInOrder(_ a: some EpisodeSortable, _ b: some EpisodeSortable, ascending: Bool) -> Bool {
+      switch self {
+      case .pubDate:
+        let d0 = a.publishedAtDate ?? .distantPast
+        let d1 = b.publishedAtDate ?? .distantPast
+        return ascending ? d0 < d1 : d0 > d1
+      case .title:
+        let order = a.title.localizedCaseInsensitiveCompare(b.title)
+        return ascending ? order == .orderedAscending : order == .orderedDescending
+      case .season:
+        let s0 = Int(a.season ?? "") ?? 0
+        let s1 = Int(b.season ?? "") ?? 0
+        if s0 != s1 { return ascending ? s0 < s1 : s0 > s1 }
+        let e0 = Int(a.episode ?? "") ?? 0
+        let e1 = Int(b.episode ?? "") ?? 0
+        return ascending ? e0 < e1 : e0 > e1
+      case .episode:
+        let e0 = Int(a.episode ?? "") ?? 0
+        let e1 = Int(b.episode ?? "") ?? 0
+        return ascending ? e0 < e1 : e0 > e1
+      }
+    }
+  }
+}
+
+protocol EpisodeSortable {
+  var title: String { get }
+  var season: String? { get }
+  var episode: String? { get }
+  var publishedAtDate: Date? { get }
+}
+
+extension PodcastDetailsView.Model.Episode: EpisodeSortable {
+  var publishedAtDate: Date? { publishedAt }
+}
+
+extension PodcastEpisode: EpisodeSortable {
+  var publishedAtDate: Date? {
+    guard let publishedAt else { return nil }
+    return Date(timeIntervalSince1970: TimeInterval(publishedAt) / 1000)
+  }
+}
+
+// MARK: - Mock
+
+extension PodcastDetailsView.Model {
+  static var mock: PodcastDetailsView.Model {
+    PodcastDetailsView.Model(
+      podcastID: "mock-podcast",
+      title: "The Daily",
+      author: "The New York Times",
+      coverURL: URL(string: "https://m.media-amazon.com/images/I/51YHc7SK5HL._SL500_.jpg"),
+      description:
+        "This is what the news should sound like. The biggest stories of our time, told by the best journalists in the world.",
+      genres: ["News", "Daily News"],
+      tags: ["news", "daily"],
+      isLoading: false,
+      isExplicit: false,
+      language: "English",
+      podcastType: "episodic",
+      durationText: "48hr 30min",
+      episodeCount: 3,
+      episodes: [
+        Episode(
+          id: "ep1",
+          title: "The Sunday Read: 'The Untold Story'",
+          season: "1",
+          episode: "1",
+          publishedAt: Date(),
+          duration: 1800,
+          size: nil,
+          description: "A deep dive into an untold story.",
+          isCompleted: true,
+          progress: 1.0,
+          chapters: [
+            Chapter(id: 0, start: 0, end: 600, title: "Introduction"),
+            Chapter(id: 1, start: 600, end: 1200, title: "The Discovery"),
+            Chapter(id: 2, start: 1200, end: 1800, title: "Conclusion"),
+          ],
+          downloadState: .notDownloaded
+        ),
+        Episode(
+          id: "ep2",
+          title: "Breaking Down the Headlines",
+          season: "1",
+          episode: "2",
+          publishedAt: Calendar.current.date(byAdding: .day, value: -1, to: Date()),
+          duration: 2400,
+          size: nil,
+          description: "Today's top headlines explained.",
+          isCompleted: false,
+          progress: 0.45,
+          chapters: [],
+          downloadState: .downloading(progress: 0.45)
+        ),
+        Episode(
+          id: "ep3",
+          title: "A New Chapter",
+          season: "1",
+          episode: "3",
+          publishedAt: Calendar.current.date(byAdding: .day, value: -2, to: Date()),
+          duration: 3600,
+          size: nil,
+          description: nil,
+          isCompleted: false,
+          progress: 0,
+          chapters: [],
+          downloadState: .downloaded
+        ),
+      ]
+    )
+  }
+}
+
+#Preview {
+  NavigationStack {
+    PodcastDetailsView(model: .mock)
+  }
+}

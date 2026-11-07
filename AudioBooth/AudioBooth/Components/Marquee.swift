@@ -1,0 +1,67 @@
+import SwiftUI
+
+struct Marquee<Content: View>: View {
+  let content: Content
+  var speed: Double = 30.0
+  var delay: Double = 1.0
+
+  @State private var width: CGFloat = .zero
+  @State private var animate: Bool = false
+
+  init(@ViewBuilder content: () -> Content) {
+    self.content = content()
+  }
+
+  var body: some View {
+    ViewThatFits(in: .horizontal) {
+      content
+        .fixedSize()
+
+      marquee
+    }
+  }
+
+  var marquee: some View {
+    ScrollView(.horizontal) {
+      HStack(spacing: 30) {
+        content
+          .background(
+            GeometryReader { geo in
+              Color.clear
+                .onAppear {
+                  width = geo.size.width
+                  animate = true
+                }
+            }
+          )
+
+        content
+          .fixedSize()
+      }
+      .offset(x: animate ? -width - 30 : 0)
+      .animation(
+        animate
+          ? Animation.linear(duration: (width + 30) / speed)
+            .delay(delay)
+            .repeatForever(autoreverses: false)
+          : .default,
+        value: animate
+      )
+    }
+    .scrollDisabled(true)
+    .scrollClipDisabled()
+    .padding(.horizontal, 8)
+    .mask(fadeMask)
+    .padding(.horizontal, -8)
+  }
+
+  private var fadeMask: some View {
+    HStack(spacing: 0) {
+      LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+        .frame(width: 12)
+      Color.black
+      LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+        .frame(width: 12)
+    }
+  }
+}

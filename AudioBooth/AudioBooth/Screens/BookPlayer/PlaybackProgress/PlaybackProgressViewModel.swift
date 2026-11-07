@@ -1,0 +1,201 @@
+import Combine
+import Models
+import SwiftUI
+
+final class PlaybackProgressViewModel: PlaybackProgressView.Model {
+  private var itemID: String
+  private var player: AudioPlayer?
+  private var chapters: ChapterPickerSheet.Model?
+  private var speed: FloatPickerSheet.Model?
+  private let preferences = UserPreferences.shared
+  private var cancellables = Set<AnyCancellable>()
+  private var lastBackgroundUpdate = Date.distantPast
+
+  private let mediaProgress: MediaProgress
+
+  init(itemID: String, mediaProgress: MediaProgress, title: String) {
+    self.itemID = itemID
+    self.mediaProgress = mediaProgress
+
+    super.init(
+      progress: 0,
+      current: 0,
+      remaining: 0,
+      total: mediaProgress.duration,
+      totalProgress: mediaProgress.progress,
+      totalTimeRemaining: mediaProgress.remaining,
+      title: title
+    )
+
+    observeMediaProgress()
+    observePreferenceChanges()
+    observeForeground()
+  }
+
+  private func observeMediaProgress() {
+    withObservationTracking {
+      _ = mediaProgress.currentTime
+    } onChange: { [weak self] in
+      guard let self else { return }
+      RunLoop.main.perform {
+        self.updateProgress()
+        self.observeMediaProgress()
+      }
+    }
+  }
+
+  private func observeForeground() {
+    NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+      .sink { [weak self] _ in
+        self?.updateProgress()
+      }
+      .store(in: &cancellables)
+  }
+
+  func configure(
+    player: AudioPlayer?,
+    chapters: ChapterPickerSheet.Model?,
+    speed: FloatPickerSheet.Model
+  ) {
+    self.player = player
+    self.chapters = chapters
+    self.speed = speed
+    updateProgress()
+  }
+
+  func updateProgress() {
+    guard !isDragging else { return }
+
+    if UIApplication.shared.applicationState == .background {
+      guard Date().timeIntervalSince(lastBackgroundUpdate) >= 10 else { return }
+      lastBackgroundUpdate = Date()
+    }
+
+    total = mediaProgress.duration
+
+    if preferences.showFullBookDuration {
+      updateBookProgress()
+    } else {
+      updateChapterProgress()
+    }
+
+    updateChapterSupplement()
+  }
+
+  private func updateChapterSupplement() {
+    guard let chapters, chapters.current != nil else {
+      chapter = nil
+      return
+    }
+
+    let currentTime = mediaProgress.currentTime
+    var elapsed = chapters.currentElapsedTime(currentTime: currentTime)
+    var remaining = chapters.currentRemainingTime(currentTime: currentTime)
+    let progress = chapters.currentProgress(currentTime: currentTime)
+
+    if let speed, preferences.chapterProgressionAdjustsWithSpeed, speed.value != 1.0 {
+      let adjustedTotal = (elapsed + remaining) / speed.value
+      elapsed = (elapsed / speed.value).rounded()
+      remaining = adjustedTotal - elapsed
+    }
+
+    chapter = PlaybackProgressView.Model.Chapter(
+      progress: progress,
+      elapsed: elapsed,
+      remaining: remaining
+    )
+  }
+
+  private func updateBookProgress() {
+    let currentTime = mediaProgress.currentTime
+    let totalDuration = total
+    let overallProgress = totalDuration > 0 ? currentTime / totalDuration : 0
+
+    var current: TimeInterval = currentTime
+    var remaining: TimeInterval = totalDuration - currentTime
+    let progress: CGFloat = CGFloat(overallProgress)
+
+    if let speed, preferences.timeRemainingAdjustsWithSpeed, speed.value != 1.0 {
+      let playbackSpeed = speed.value
+      let adjustedTotal = (current + remaining) / playbackSpeed
+      current = (current / playbackSpeed).rounded()
+      remaining = adjustedTotal - current
+    }
+
+    var totalTimeRemaining = (totalDuration - currentTime)
+    if let speed, preferences.timeRemainingAdjustsWithSpeed {
+      totalTimeRemaining /= speed.value
+    }
+
+    self.progress = progress
+    self.current = current
+    self.remaining = remaining
+    self.totalProgress = overallProgress
+    self.totalTimeRemaining = totalTimeRemaining
+  }
+
+  private func updateChapterProgress() {
+    let currentTime = mediaProgress.currentTime
+    let totalDuration = total
+    let overallProgress = totalDuration > 0 ? currentTime / totalDuration : 0
+
+    var current: TimeInterval
+    var remaining: TimeInterval
+    let progress: CGFloat
+
+    if let chapters, chapters.current != nil {
+      current = chapters.currentElapsedTime(currentTime: currentTime)
+      remaining = chapters.currentRemainingTime(currentTime: currentTime)
+      progress = CGFloat(chapters.currentProgress(currentTime: currentTime))
+    } else {
+      current = currentTime
+      remaining = totalDuration - currentTime
+      progress = CGFloat(overallProgress)
+    }
+
+    if let speed, preferences.chapterProgressionAdjustsWithSpeed, speed.value != 1.0 {
+      let playbackSpeed = speed.value
+      let adjustedTotal = (current + remaining) / playbackSpeed
+      current = (current / playbackSpeed).rounded()
+      remaining = adjustedTotal - current
+    }
+
+    var totalTimeRemaining = (totalDuration - currentTime)
+    if let speed, preferences.timeRemainingAdjustsWithSpeed {
+      totalTimeRemaining /= speed.value
+    }
+
+    self.progress = progress
+    self.current = current
+    self.remaining = remaining
+    self.totalProgress = overallProgress
+    self.totalTimeRemaining = totalTimeRemaining
+  }
+
+  override func onProgressChanged(_ progress: Double) {
+    guard let player else { return }
+
+    if !preferences.showFullBookDuration, let chapter = chapters?.current {
+      let duration = chapter.end - chapter.start
+      let currentTime = min(max(chapter.start + (duration * progress), chapter.start + 0.1), chapter.end - 0.1)
+      player.seek(to: currentTime)
+      PlaybackHistory.record(itemID: itemID, action: .seek, position: currentTime)
+    } else {
+      let currentTime = total * progress
+      player.seek(to: currentTime)
+      PlaybackHistory.record(itemID: itemID, action: .seek, position: currentTime)
+    }
+
+    mediaProgress.lastPlayedAt = Date()
+    updateProgress()
+  }
+
+  private func observePreferenceChanges() {
+    preferences.objectWillChange
+      .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
+      .sink { [weak self] _ in
+        self?.updateProgress()
+      }
+      .store(in: &cancellables)
+  }
+}

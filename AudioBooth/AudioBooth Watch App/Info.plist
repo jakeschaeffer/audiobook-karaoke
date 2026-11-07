@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>INAlternativeAppNames</key>
+	<array>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>Audiobook</string>
+			<key>INAlternativeAppNamePronunciationHint</key>
+			<string>Audiobook</string>
+		</dict>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>ABS</string>
+			<key>INAlternativeAppNamePronunciationHint</key>
+			<string>ABS</string>
+		</dict>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>Audiobookshelf</string>
+			<key>INAlternativeAppNamePronunciationHint</key>
+			<string>Audiobookshelf</string>
+		</dict>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>AudioBooth needs access to your local network to connect to your Audiobookshelf server and stream audiobooks.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+</dict>
+</plist>

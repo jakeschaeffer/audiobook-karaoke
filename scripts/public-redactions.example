@@ -1,0 +1,15 @@
+# Copy to scripts/public-redactions (gitignored: this map IS the list of private details).
+# One rule per line: the literal to remove, a TAB, its replacement. Longest literals apply first.
+# scripts/public-snapshot.sh replaces these in every text file of the export and refuses to
+# commit if any survives. What belongs here: your ABS and companion hostnames, LAN/tailnet
+# addresses and ssh targets, server-side paths, your Apple team id and the certificate's legal
+# name, your bundle ids. GitHub handles and first names in the docs are fine to leave.
+abs.yourdomain.tld	abs.example.com
+captions.yourdomain.tld	captions.example.com
+jobs.yourdomain.tld	jobs.example.com
+you@nas.example	you@your-nas
+nas.example	<nas-tailnet-ip>
+/mnt/pool/you/abs-session	/path/to/abs-session
+Your Name (TEAMID1234)	<Account Holder> (<TEAM_ID>)
+TEAMID1234	<TEAM_ID>
+com.yourorg.AudioBS	com.example.AudioBS

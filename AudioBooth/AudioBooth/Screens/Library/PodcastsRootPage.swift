@@ -1,0 +1,98 @@
+import API
+import Combine
+import SwiftUI
+
+struct PodcastsRootPage: View {
+  @Environment(\.appTheme) var theme
+  @Environment(\.isPartiallyFolded) private var isPartiallyFolded
+  enum SectionType: CaseIterable {
+    case podcasts
+    case playlists
+
+    var next: SectionType {
+      let all = SectionType.allCases
+      let index = all.firstIndex(of: self) ?? 0
+      return all[(index + 1) % all.count]
+    }
+  }
+
+  @ObservedObject var model: Model
+  @ObservedObject private var libraries = Audiobookshelf.shared.libraries
+
+  var body: some View {
+    NavigationStack(path: $model.path) {
+      PodcastsRootContent(selected: $model.selected)
+        .id(libraries.current?.id)
+        .background(theme.colors.background.page.ignoresSafeArea())
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+          ToolbarItem(placement: isPartiallyFolded ? .topBarLeading : .principal) {
+            Picker("Section", selection: $model.selected) {
+              Text("Podcasts").tag(SectionType.podcasts)
+              Text("Playlists").tag(SectionType.playlists)
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.large)
+            .tint(.primary)
+            .fixedSize(horizontal: true, vertical: true)
+          }
+          .sharedBackgroundHidden()
+        }
+        .navigationDestinations { destination in
+          switch destination {
+          case .book(let id):
+            BookDetailsView(model: BookDetailsViewModel(bookID: id))
+          case .podcast(let id, let episodeID):
+            PodcastDetailsView(model: PodcastDetailsViewModel(podcastID: id, episodeID: episodeID))
+          case .podcastFeed(let id, let podcastTitle, let coverURL, let feedURL):
+            PodcastFeedView(
+              model: PodcastFeedViewModel(
+                podcastID: id,
+                podcastTitle: podcastTitle,
+                coverURL: coverURL,
+                feedURL: feedURL
+              )
+            )
+          case .playlist(let id):
+            CollectionDetailPage(model: CollectionDetailPageModel(collectionID: id, mode: .playlists))
+          case .genre, .tag:
+            LibraryPage(model: PodcastLibraryPageModel(destination: destination))
+          default:
+            EmptyView()
+          }
+        }
+    }
+  }
+}
+
+private struct PodcastsRootContent: View {
+  @Binding var selected: PodcastsRootPage.SectionType
+
+  @StateObject private var podcasts = PodcastLibraryPageModel()
+  @StateObject private var playlists = CollectionsPageModel(mode: .playlists)
+
+  var body: some View {
+    switch selected {
+    case .podcasts:
+      LibraryPage(model: podcasts)
+    case .playlists:
+      CollectionsPage(model: playlists)
+    }
+  }
+}
+
+extension PodcastsRootPage {
+  @Observable
+  class Model: ObservableObject {
+    var selected: SectionType = .podcasts
+    var path = NavigationPath()
+
+    func onTabItemTapped() {
+      if path.isEmpty {
+        selected = selected.next
+      } else {
+        path = NavigationPath()
+      }
+    }
+  }
+}

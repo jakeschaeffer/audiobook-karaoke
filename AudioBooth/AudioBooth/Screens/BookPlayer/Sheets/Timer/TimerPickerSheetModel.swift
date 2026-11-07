@@ -1,0 +1,914 @@
+import AVFoundation
+import Combine
+import Foundation
+import Logging
+import Models
+import PlayerIntents
+import SwiftUI
+
+#if !targetEnvironment(macCatalyst)
+import ActivityKit
+#endif
+
+final class TimerPickerSheetViewModel: TimerPickerSheet.Model {
+  private let preferences = UserPreferences.shared
+  private let itemID: String
+  let player: AudioPlayer
+  private let chapters: ChapterPickerSheet.Model?
+  private let speed: FloatPickerSheet.Model
+  private let alarmNotificationService = AlarmNotificationService()
+
+  private var sleepTimer: Timer?
+  private var alarmTimer: Timer?
+  private var autoTimerWindowTimer: Timer?
+  private var alarmSoundPlayer: AVAudioPlayer?
+  private var originalTimerDuration: TimeInterval = 0
+  private var lastObservedChapterIndex: Int = 0
+  private var cancellables = Set<AnyCancellable>()
+  private var outputVolumeObservation: NSKeyValueObservation?
+  #if !targetEnvironment(macCatalyst)
+  private var liveActivity: Activity<SleepTimerActivityAttributes>?
+  #endif
+
+  init(itemID: String, player: AudioPlayer, chapters: ChapterPickerSheet.Model?, speed: FloatPickerSheet.Model) {
+    self.itemID = itemID
+    self.player = player
+    self.chapters = chapters
+    self.speed = speed
+
+    super.init()
+
+    let totalMinutes = preferences.customTimerMinutes
+    customHours = totalMinutes / 60
+    customMinutes = totalMinutes % 60
+
+    if let chapters {
+      maxRemainingChapters = chapters.chapters.count - chapters.currentIndex - 1
+      lastObservedChapterIndex = chapters.currentIndex
+    }
+
+    ShakeDetector.shared.stopMonitoring()
+    setupShakeObserver()
+    setupVolumeObserver()
+    observeChapterChanges()
+  }
+
+  isolated deinit {
+    sleepTimer?.invalidate()
+    alarmTimer?.invalidate()
+    autoTimerWindowTimer?.invalidate()
+    endLiveActivity()
+  }
+
+  private func setupShakeObserver() {
+    ShakeDetector.shared.shakePublisher
+      .sink { [weak self] in
+        self?.onShakeDetected()
+      }
+      .store(in: &cancellables)
+  }
+
+  private func setupVolumeObserver() {
+    outputVolumeObservation = AVAudioSession.sharedInstance().observe(
+      \.outputVolume,
+      options: [.old, .new]
+    ) { [weak self] _, change in
+      guard let self, let oldValue = change.oldValue, let newValue = change.newValue, newValue > oldValue else {
+        return
+      }
+      Task { @MainActor in
+        self.onVolumeUp()
+      }
+    }
+  }
+
+  private func onVolumeUp() {
+    guard isFading else { return }
+    restartTimer(source: "volume up during fade")
+  }
+
+  private func observeChapterChanges() {
+    guard let chapters else { return }
+
+    withObservationTracking {
+      _ = chapters.currentIndex
+    } onChange: { [weak self] in
+      guard let self else { return }
+      RunLoop.main.perform {
+        self.handleChapterChange()
+        self.observeChapterChanges()
+      }
+    }
+  }
+
+  private func handleChapterChange() {
+    guard let chapters else { return }
+
+    let currentIndex = chapters.currentIndex
+    let total = chapters.chapters.count
+    maxRemainingChapters = total - currentIndex - 1
+
+    if case .chapters(let chaptersRemaining) = self.current {
+      if lastObservedChapterIndex < currentIndex {
+        if chaptersRemaining > 1 {
+          self.current = .chapters(chaptersRemaining - 1)
+        } else {
+          pauseFromChapterTimer()
+        }
+      }
+    }
+
+    lastObservedChapterIndex = currentIndex
+  }
+
+  override var isPresented: Bool {
+    didSet {
+      if isPresented && !oldValue {
+        selected = current
+        if case .chapters(let count) = current {
+          updateEstimatedEndTime(for: count)
+        }
+      }
+    }
+  }
+
+  override func onQuickTimerSelected(_ minutes: Int) {
+    let duration = TimeInterval(minutes * 60)
+    selected = .preset(duration)
+    estimatedEndTime = nil
+    onStartTimerTapped()
+  }
+
+  override func onAddTimeTapped(_ minutes: Int) {
+    let additional = TimeInterval(minutes * 60)
+
+    let newRemaining: TimeInterval
+    switch current {
+    case .preset(let seconds):
+      newRemaining = seconds + additional
+      current = .preset(newRemaining)
+    case .custom(let seconds):
+      newRemaining = seconds + additional
+      current = .custom(newRemaining)
+    case .chapters, .atTime, .duration, .none:
+      return
+    }
+
+    player.volume = Float(preferences.volumeLevel)
+    startLiveActivity(duration: newRemaining)
+    PlaybackHistory.record(itemID: itemID, action: .timerExtended, position: player.time)
+    AppLogger.player.info("Sleep timer extended by \(minutes) minutes")
+  }
+
+  override func onChaptersChanged(_ value: Int) {
+    selected = .chapters(value)
+    updateEstimatedEndTime(for: value)
+  }
+
+  override func onRunningChaptersChanged(_ value: Int) {
+    guard case .chapters(let count) = current, value >= 1, value <= maxRemainingChapters else { return }
+
+    current = .chapters(value)
+
+    if let duration = calculateChapterDuration(for: value) {
+      startLiveActivity(duration: duration)
+    }
+
+    if value > count {
+      PlaybackHistory.record(itemID: itemID, action: .timerExtended, position: player.time)
+    }
+    AppLogger.player.info("Chapter timer changed to \(value) chapters")
+  }
+
+  private func updateEstimatedEndTime(for chapterCount: Int) {
+    guard let chapters, chapterCount > 0 else {
+      estimatedEndTime = nil
+      return
+    }
+
+    let currentTime = player.time
+    let currentIndex = chapters.currentIndex
+    let allChapters = chapters.chapters
+
+    guard currentIndex < allChapters.count else {
+      estimatedEndTime = nil
+      return
+    }
+
+    var totalSeconds: TimeInterval = 0
+
+    let currentChapter = allChapters[currentIndex]
+    totalSeconds += max(0, currentChapter.end - currentTime)
+
+    let additionalChaptersNeeded = chapterCount - 1
+    if additionalChaptersNeeded > 0 {
+      for i in 1...additionalChaptersNeeded {
+        let chapterIndex = currentIndex + i
+        guard chapterIndex < allChapters.count else { break }
+        let chapter = allChapters[chapterIndex]
+        totalSeconds += chapter.end - chapter.start
+      }
+    }
+
+    let playbackSpeed = speed.value
+    let adjustedSeconds = totalSeconds / playbackSpeed
+
+    let endDate = Date().addingTimeInterval(adjustedSeconds)
+
+    let time = endDate.formatted(date: .omitted, time: .shortened)
+
+    estimatedEndTime = String(localized: "Pauses at \(time)")
+  }
+
+  override func onOffSelected() {
+    selected = .none
+    current = .none
+    completedAlert = nil
+    estimatedEndTime = nil
+    stopSleepTimer()
+    endLiveActivity()
+    isPresented = false
+  }
+
+  override func onStartTimerTapped() {
+    current = selected
+    switch selected {
+    case .preset(let duration):
+      startSleepTimer(duration: duration)
+    case .custom(let duration):
+      let totalMinutes = customHours * 60 + customMinutes
+      preferences.customTimerMinutes = totalMinutes
+      startSleepTimer(duration: duration)
+    case .chapters(let count):
+      if let duration = calculateChapterDuration(for: count) {
+        startLiveActivity(duration: duration)
+      }
+    case .atTime, .duration, .none:
+      break
+    }
+    PlaybackHistory.record(itemID: itemID, action: .timerStarted, position: player.time)
+    isPresented = false
+
+    if !player.isPlaying {
+      player.resume()
+    }
+  }
+
+  private func calculateChapterDuration(for chapterCount: Int) -> TimeInterval? {
+    guard let chapters, chapterCount > 0 else { return nil }
+
+    let currentTime = player.time
+    let currentIndex = chapters.currentIndex
+    let allChapters = chapters.chapters
+
+    guard currentIndex < allChapters.count else { return nil }
+
+    var totalSeconds: TimeInterval = 0
+
+    let currentChapter = allChapters[currentIndex]
+    totalSeconds += max(0, currentChapter.end - currentTime)
+
+    let additionalChaptersNeeded = chapterCount - 1
+    if additionalChaptersNeeded > 0 {
+      for i in 1...additionalChaptersNeeded {
+        let chapterIndex = currentIndex + i
+        guard chapterIndex < allChapters.count else { break }
+        let chapter = allChapters[chapterIndex]
+        totalSeconds += chapter.end - chapter.start
+      }
+    }
+
+    let playbackSpeed = speed.value
+    return totalSeconds / playbackSpeed
+  }
+
+  private func startSleepTimer(duration: TimeInterval) {
+    stopSleepTimer()
+    originalTimerDuration = duration
+
+    sleepTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+      guard let self else { return }
+      self.updateSleepTimer()
+    }
+
+    RunLoop.current.add(sleepTimer!, forMode: .common)
+
+    ShakeDetector.shared.startMonitoring()
+
+    startLiveActivity(duration: duration)
+  }
+
+  private func stopSleepTimer() {
+    sleepTimer?.invalidate()
+    sleepTimer = nil
+    originalTimerDuration = 0
+
+    ShakeDetector.shared.stopMonitoring()
+    endLiveActivity()
+  }
+
+  private func updateSleepTimer() {
+    if !player.isPlaying {
+      switch preferences.timerPauseBehavior {
+      case .none:
+        break
+      case .pause:
+        return
+      case .reset:
+        resetTimerToOriginalDuration()
+        return
+      case .off:
+        cancelTimerForPause()
+        return
+      }
+    }
+
+    switch current {
+    case .preset(let seconds):
+      if seconds > 1 {
+        fadeOut(seconds)
+        current = .preset(seconds - 1)
+      } else {
+        pauseFromTimer()
+      }
+
+    case .custom(let seconds):
+      if seconds > 1 {
+        fadeOut(seconds)
+        current = .custom(seconds - 1)
+      } else {
+        pauseFromTimer()
+      }
+
+    case .none, .chapters, .atTime, .duration:
+      stopSleepTimer()
+    }
+  }
+
+  private func fadeOut(_ seconds: TimeInterval) {
+    let fadeOut = preferences.timerFadeOut
+    if fadeOut > 0, seconds < fadeOut {
+      player.volume = Float(seconds / fadeOut) * Float(preferences.volumeLevel)
+    }
+  }
+
+  private func pauseFromTimer() {
+    let duration = originalTimerDuration
+
+    PlaybackHistory.record(itemID: itemID, action: .timerCompleted, position: player.time)
+    player.pause()
+    player.volume = Float(preferences.volumeLevel)
+
+    if preferences.shakeSensitivity.isEnabled {
+      let extendAction = formatExtendButtonTitle(for: duration)
+      completedAlert = TimerCompletedAlertViewModel(
+        extendAction: extendAction,
+        onExtend: { [weak self] in
+          self?.extendTimer()
+        },
+        onReset: { [weak self] in
+          self?.resetTimerFromAlert()
+        }
+      )
+    }
+
+    current = .none
+    sleepTimer?.invalidate()
+    sleepTimer = nil
+
+    pauseLiveActivity(remaining: originalTimerDuration)
+    SleepTimerActivityCleanup.shared.schedule(for: .expired)
+
+    AppLogger.player.info("Timer expired - playback paused")
+  }
+
+  private func formatExtendButtonTitle(for duration: TimeInterval) -> String {
+    let formattedDuration = Duration.seconds(duration).formatted(
+      .units(
+        allowed: [.hours, .minutes],
+        width: .narrow
+      )
+    )
+    return String(localized: "Extend \(formattedDuration)")
+  }
+
+  private func extendTimer() {
+    guard originalTimerDuration > 0 else {
+      completedAlert = nil
+      return
+    }
+
+    startSleepTimer(duration: originalTimerDuration)
+    current = .preset(originalTimerDuration)
+    PlaybackHistory.record(itemID: itemID, action: .timerExtended, position: player.time)
+
+    player.resume()
+
+    completedAlert = nil
+    AppLogger.player.info("Timer extended by \(self.originalTimerDuration) seconds")
+  }
+
+  private func resetTimerFromAlert() {
+    completedAlert = nil
+    current = .none
+    sleepTimer?.invalidate()
+    sleepTimer = nil
+    originalTimerDuration = 0
+
+    ShakeDetector.shared.stopMonitoring()
+    endLiveActivity()
+
+    AppLogger.player.info("Timer reset from alert")
+  }
+
+  func pauseFromChapterTimer() {
+    PlaybackHistory.record(itemID: itemID, action: .timerCompleted, position: player.time)
+    player.pause()
+
+    if preferences.shakeSensitivity.isEnabled {
+      completedAlert = TimerCompletedAlertViewModel(
+        extendAction: "Extend to end of chapter",
+        onExtend: { [weak self] in
+          self?.extendChapterTimer()
+        },
+        onReset: { [weak self] in
+          self?.resetTimerFromAlert()
+        }
+      )
+    }
+
+    current = .none
+    pauseLiveActivity(remaining: 0)
+    SleepTimerActivityCleanup.shared.schedule(for: .expired)
+    AppLogger.player.info("Chapter timer expired - playback paused")
+  }
+
+  private func extendChapterTimer() {
+    current = .chapters(1)
+
+    if let duration = calculateChapterDuration(for: 1) {
+      startLiveActivity(duration: duration)
+    }
+    PlaybackHistory.record(itemID: itemID, action: .timerExtended, position: player.time)
+
+    player.resume()
+
+    completedAlert = nil
+    AppLogger.player.info("Chapter timer extended by 1 chapter")
+  }
+
+  private func currentTimeInMinutes() -> Int {
+    let now = Date()
+    let calendar = Calendar.current
+    let hour = calendar.component(.hour, from: now)
+    let minute = calendar.component(.minute, from: now)
+    return hour * 60 + minute
+  }
+
+  private func isInAutoTimerWindow() -> Bool {
+    let currentMinutes = currentTimeInMinutes()
+    let startMinutes = preferences.autoTimerWindowStart
+    let endMinutes = preferences.autoTimerWindowEnd
+
+    if startMinutes < endMinutes {
+      return currentMinutes >= startMinutes && currentMinutes < endMinutes
+    } else {
+      return currentMinutes >= startMinutes || currentMinutes < endMinutes
+    }
+  }
+
+  func activateAutoTimerIfNeeded() {
+    let mode = preferences.autoTimerMode
+    let trigger = preferences.autoTimerTrigger
+
+    guard mode != .off, current == .none else { return }
+
+    if trigger != .focus {
+      if isInAutoTimerWindow() {
+        startAutoTimer(mode: mode)
+        return
+      }
+      scheduleAutoTimerAtWindowStart()
+    }
+
+    guard trigger != .timeWindow else { return }
+
+    Task { [weak self] in
+      guard await FocusFilterIntent.isActive else { return }
+      guard let self, self.current == .none else { return }
+      self.startAutoTimer(mode: self.preferences.autoTimerMode)
+    }
+  }
+
+  private func scheduleAutoTimerAtWindowStart() {
+    autoTimerWindowTimer?.invalidate()
+
+    let startMinutes = preferences.autoTimerWindowStart
+    let components = DateComponents(hour: startMinutes / 60, minute: startMinutes % 60)
+    guard
+      let fireDate = Calendar.current.nextDate(after: Date(), matching: components, matchingPolicy: .nextTime)
+    else { return }
+
+    autoTimerWindowTimer = Timer.scheduledTimer(
+      withTimeInterval: fireDate.timeIntervalSinceNow,
+      repeats: false
+    ) { [weak self] _ in
+      guard let self else { return }
+      self.activateWindowTimer()
+    }
+  }
+
+  private func activateWindowTimer() {
+    guard preferences.autoTimerMode != .off,
+      preferences.autoTimerTrigger != .focus,
+      current == .none,
+      player.isPlaying,
+      isInAutoTimerWindow()
+    else {
+      return
+    }
+
+    AppLogger.player.info("Time window started during playback - starting auto-timer")
+    startAutoTimer(mode: preferences.autoTimerMode)
+  }
+
+  func activateFocusTimer() {
+    guard preferences.autoTimerMode != .off,
+      current == .none,
+      player.isPlaying
+    else {
+      return
+    }
+
+    AppLogger.player.info("Focus enabled during playback - starting auto-timer")
+    startAutoTimer(mode: preferences.autoTimerMode)
+  }
+
+  private func startAutoTimer(mode: AutoTimerMode) {
+    guard !AVAudioSession.sharedInstance().isCarPlayConnected else {
+      AppLogger.player.info("CarPlay is connected - skipping auto-timer")
+      return
+    }
+
+    let position = player.time
+
+    switch mode {
+    case .duration(let duration):
+      current = .preset(duration)
+      startSleepTimer(duration: duration)
+      PlaybackHistory.record(itemID: itemID, action: .timerStarted, position: position)
+      AppLogger.player.info("Auto-timer activated: \(duration) seconds")
+
+    case .chapters(let count):
+      current = .chapters(count)
+      if let duration = calculateChapterDuration(for: count) {
+        startLiveActivity(duration: duration)
+      }
+      PlaybackHistory.record(itemID: itemID, action: .timerStarted, position: position)
+      AppLogger.player.info("Auto-timer activated: \(count) chapters")
+
+    case .off:
+      break
+    }
+  }
+
+  private func resetTimerToOriginalDuration() {
+    guard originalTimerDuration > 0 else { return }
+
+    switch current {
+    case .preset(let seconds):
+      guard seconds != originalTimerDuration else { return }
+      current = .preset(originalTimerDuration)
+    case .custom(let seconds):
+      guard seconds != originalTimerDuration else { return }
+      current = .custom(originalTimerDuration)
+    case .chapters, .atTime, .duration, .none:
+      return
+    }
+
+    player.volume = Float(preferences.volumeLevel)
+    pauseLiveActivity()
+  }
+
+  private func cancelTimerForPause() {
+    switch current {
+    case .preset, .custom:
+      current = .none
+      stopSleepTimer()
+      player.volume = Float(preferences.volumeLevel)
+    case .chapters, .atTime, .duration, .none:
+      break
+    }
+  }
+
+  func onShakeDetected() {
+    guard preferences.shakeSensitivity.isEnabled else { return }
+    restartTimer(source: "shake")
+  }
+
+  override func extendIfNeeded() -> Bool {
+    if let completedAlert {
+      if completedAlert.isExpired {
+        completedAlert.onResetTapped()
+      } else if preferences.shakeSensitivity.isEnabled {
+        completedAlert.onExtendTapped()
+        return true
+      }
+      return false
+    }
+
+    guard isFading else { return false }
+    restartTimer(source: "remote command during fade")
+    return true
+  }
+
+  private var isFading: Bool {
+    let fadeOut = preferences.timerFadeOut
+    guard player.isPlaying, fadeOut > 0 else { return false }
+
+    switch current {
+    case .preset(let seconds), .custom(let seconds):
+      return seconds < fadeOut
+    case .chapters, .atTime, .duration, .none:
+      return false
+    }
+  }
+
+  private func restartTimer(source: String) {
+    guard originalTimerDuration > 0 else { return }
+
+    player.volume = Float(preferences.volumeLevel)
+
+    switch current {
+    case .preset:
+      current = .preset(originalTimerDuration)
+      startSleepTimer(duration: originalTimerDuration)
+      AppLogger.player.info("Preset timer reset to \(originalTimerDuration) seconds via \(source)")
+
+    case .custom:
+      current = .custom(originalTimerDuration)
+      startSleepTimer(duration: originalTimerDuration)
+      AppLogger.player.info("Custom timer reset to \(originalTimerDuration) seconds via \(source)")
+
+    case .chapters:
+      AppLogger.player.debug("Reset via \(source) during chapter timer - no reset action")
+
+    case .atTime, .duration, .none:
+      break
+    }
+  }
+
+  override func onAlarmStartTapped() {
+    alarmSoundPlayer?.stop()
+    alarmSoundPlayer = nil
+    completedAlert = nil
+
+    let triggerDate = makeAlarmTriggerDate()
+    current = .atTime(triggerDate)
+
+    startAlarmTimer()
+    scheduleAlarmNotification(triggerDate: triggerDate)
+    isPresented = false
+  }
+
+  override func onAlarmOffTapped() {
+    stopAlarmTimer()
+    current = .none
+    alarmSoundPlayer?.stop()
+    alarmSoundPlayer = nil
+    player.volume = Float(preferences.volumeLevel)
+    completedAlert = nil
+    alarmNotificationService.cancel()
+    isPresented = false
+  }
+
+  private func startAlarmTimer() {
+    stopAlarmTimer()
+    alarmTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+      self?.updateAlarm()
+    }
+    if let alarmTimer {
+      RunLoop.current.add(alarmTimer, forMode: .common)
+    }
+  }
+
+  private func stopAlarmTimer() {
+    alarmTimer?.invalidate()
+    alarmTimer = nil
+  }
+
+  private func updateAlarm() {
+    guard case .atTime(let trigger) = current else {
+      stopAlarmTimer()
+      return
+    }
+
+    let remaining = trigger.timeIntervalSinceNow
+
+    if remaining <= 0 {
+      player.pause()
+      playAlarmTone()
+      stopAlarmTimer()
+      presentAlarmRingingAlert()
+      return
+    }
+
+    let fadeDuration = preferences.alarmFadeOut
+    if player.isPlaying, fadeDuration > 0, remaining <= fadeDuration {
+      player.volume = Float(max(remaining, 0) / fadeDuration) * Float(preferences.volumeLevel)
+    }
+  }
+
+  private func presentAlarmRingingAlert() {
+    completedAlert = TimerCompletedAlertViewModel(
+      extendAction: String(localized: "Snooze 5 min"),
+      style: .alarm,
+      onExtend: { [weak self] in
+        self?.snoozeAlarm(minutes: 5)
+      },
+      onReset: { [weak self] in
+        self?.onAlarmOffTapped()
+      }
+    )
+  }
+
+  private func snoozeAlarm(minutes: Int) {
+    alarmSoundPlayer?.stop()
+    alarmSoundPlayer = nil
+    completedAlert = nil
+
+    let triggerDate = Date().addingTimeInterval(TimeInterval(minutes * 60))
+    current = .atTime(triggerDate)
+    player.volume = Float(preferences.volumeLevel)
+
+    startAlarmTimer()
+    scheduleAlarmNotification(triggerDate: triggerDate)
+  }
+
+  private func playAlarmTone() {
+    guard let url = Bundle.main.url(forResource: "alarm_tone", withExtension: "wav") else {
+      return
+    }
+
+    do {
+      let alarmPlayer = try AVAudioPlayer(contentsOf: url)
+      alarmPlayer.numberOfLoops = -1
+      alarmPlayer.prepareToPlay()
+      alarmPlayer.play()
+      alarmSoundPlayer = alarmPlayer
+    } catch {
+      alarmSoundPlayer = nil
+    }
+  }
+
+  private func makeAlarmTriggerDate() -> Date {
+    switch selected {
+    case .atTime(let date):
+      let calendar = Calendar.current
+      let components = calendar.dateComponents([.hour, .minute], from: date)
+      let next = calendar.nextDate(
+        after: .now,
+        matching: DateComponents(hour: components.hour, minute: components.minute),
+        matchingPolicy: .nextTime
+      )
+      return next ?? Date().addingTimeInterval(60)
+
+    case .duration(let seconds):
+      return Date().addingTimeInterval(max(60, seconds))
+
+    case .preset, .custom, .chapters, .none:
+      return Date().addingTimeInterval(60)
+    }
+  }
+
+  private func scheduleAlarmNotification(triggerDate: Date) {
+    Task { [weak self] in
+      guard let self else { return }
+      let hasPermission = await alarmNotificationService.requestAuthorizationIfNeeded()
+      guard hasPermission else { return }
+      await alarmNotificationService.schedule(triggerDate: triggerDate)
+    }
+  }
+
+}
+
+extension TimerPickerSheetViewModel {
+  #if !targetEnvironment(macCatalyst)
+  func startLiveActivity(duration: TimeInterval) {
+    SleepTimerActivityCleanup.shared.cancel()
+
+    let endTime = Date().addingTimeInterval(duration)
+    let state = SleepTimerActivityAttributes.ContentState(
+      timer: .countdown(endTime),
+      accentColor: preferences.accentColor
+    )
+
+    if liveActivity != nil {
+      updateLiveActivity(state)
+      return
+    }
+
+    guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+      AppLogger.player.debug("Live Activities not enabled")
+      return
+    }
+
+    let attributes = SleepTimerActivityAttributes()
+    do {
+      liveActivity = try Activity.request(
+        attributes: attributes,
+        content: .init(state: state, staleDate: endTime),
+        pushType: nil
+      )
+      AppLogger.player.info("Sleep timer Live Activity started")
+    } catch {
+      AppLogger.player.error("Failed to start Live Activity: \(error)")
+    }
+  }
+
+  func updateLiveActivity(_ state: SleepTimerActivityAttributes.ContentState) {
+    guard let liveActivity else { return }
+
+    let staleDate: Date? = if case .countdown(let endTime) = state.timer { endTime } else { nil }
+    Task {
+      await liveActivity.update(.init(state: state, staleDate: staleDate))
+    }
+  }
+
+  func endLiveActivity() {
+    SleepTimerActivityCleanup.shared.cancel()
+
+    guard let liveActivity else { return }
+
+    Task {
+      await liveActivity.end(nil, dismissalPolicy: .immediate)
+      AppLogger.player.info("Sleep timer Live Activity ended")
+    }
+    self.liveActivity = nil
+  }
+
+  func pauseLiveActivity(remaining: TimeInterval? = nil) {
+    guard liveActivity != nil else { return }
+
+    let remainingTime: TimeInterval
+    if let remaining {
+      remainingTime = remaining
+    } else {
+      switch current {
+      case .preset(let seconds), .custom(let seconds):
+        remainingTime = seconds
+      case .chapters(let count):
+        remainingTime = calculateChapterDuration(for: count) ?? 0
+      case .atTime, .duration, .none:
+        remainingTime = 0
+      }
+    }
+
+    let state = SleepTimerActivityAttributes.ContentState(
+      timer: .paused(remainingTime),
+      accentColor: preferences.accentColor
+    )
+    updateLiveActivity(state)
+    SleepTimerActivityCleanup.shared.schedule(for: .paused)
+  }
+
+  func pauseLiveActivityIfNeeded() {
+    switch current {
+    case .preset, .custom:
+      guard preferences.timerPauseBehavior != .none else { return }
+    case .chapters, .atTime, .duration, .none:
+      break
+    }
+    pauseLiveActivity()
+  }
+
+  func resumeLiveActivityIfNeeded() {
+    guard liveActivity != nil else { return }
+
+    let duration: TimeInterval
+    switch current {
+    case .preset(let remaining), .custom(let remaining):
+      duration = remaining
+    case .chapters(let count):
+      duration = calculateChapterDuration(for: count) ?? 0
+    case .atTime, .duration, .none:
+      return
+    }
+
+    let endTime = Date().addingTimeInterval(duration)
+    let state = SleepTimerActivityAttributes.ContentState(
+      timer: .countdown(endTime),
+      accentColor: preferences.accentColor
+    )
+    updateLiveActivity(state)
+    SleepTimerActivityCleanup.shared.cancel()
+  }
+  #else
+  func startLiveActivity(duration: TimeInterval) {}
+  func updateLiveActivity(_ state: Any) {}
+  func endLiveActivity() {}
+  func pauseLiveActivity(remaining: TimeInterval? = nil) {}
+  func pauseLiveActivityIfNeeded() {}
+  func resumeLiveActivityIfNeeded() {}
+  #endif
+}

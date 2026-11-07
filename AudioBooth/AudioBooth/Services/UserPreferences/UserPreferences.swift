@@ -1,0 +1,717 @@
+import API
+import Combine
+import Foundation
+import Network
+import SwiftUI
+
+final class UserPreferences: ObservableObject {
+  static let shared = UserPreferences()
+
+  @AppStorage("homeSections")
+  var homeSections: [HomeSection] = HomeSection.defaultCases
+
+  @AppStorage("playerControls")
+  var playerControls: [PlayerControl] = PlayerControl.default
+
+  @AppStorage("autoDownloadBooks")
+  var autoDownloadBooks: AutoDownloadMode = .off
+
+  @AppStorage("removeDownloadOnCompletion")
+  var removeDownloadOnCompletion: Bool = false
+
+  @AppStorage("autoDownloadDelay")
+  var autoDownloadDelay: AutoDownloadDelay = .none
+
+  @AppStorage("maxDownloadStorage")
+  var maxDownloadStorageGB: Int = 0
+
+  @AppStorage("removeAfterUnused")
+  var removeAfterUnused: RemoveAfterUnused = .never
+
+  @AppStorage("skipForwardInterval")
+  var skipForwardInterval: Double = 30.0
+
+  @AppStorage("skipBackwardInterval")
+  var skipBackwardInterval: Double = 30.0
+
+  @AppStorage("smartRewindInterval")
+  var smartRewindInterval: Double = 15.0
+
+  @AppStorage("smartRewindMaxInterval")
+  var smartRewindMaxInterval: Double = 30.0
+
+  @AppStorage("smartRewindAfterPauseThreshold")
+  var smartRewindAfterPauseThreshold: Double = 600.0
+
+  @AppStorage("smartRewindChapterBarrier")
+  var smartRewindChapterBarrier: Bool = true
+
+  @AppStorage("smartRewindOnSessionStart")
+  var smartRewindOnSessionStart: Bool = true
+
+  @AppStorage("smartRewindOnInterruptionInterval")
+  var smartRewindOnInterruptionInterval: Double = 0.0
+
+  @AppStorage("shakeSensitivity")
+  var shakeSensitivity: ShakeSensitivity = .medium
+
+  @AppStorage("customTimerMinutes")
+  var customTimerMinutes: Int = 1
+
+  @AppStorage("timerFadeOut")
+  var timerFadeOut: Double = 30.0
+
+  @AppStorage("timerPauseBehavior")
+  var timerPauseBehavior: TimerPauseBehavior = .none
+
+  @AppStorage("alarmFadeOut")
+  var alarmFadeOut: Double = 10.0
+
+  @AppStorage("lockScreenNextPreviousUsesChapters")
+  var lockScreenNextPreviousUsesChapters: Bool = false
+
+  @AppStorage("lockScreenAllowPlaybackPositionChange")
+  var lockScreenAllowPlaybackPositionChange: Bool = true
+
+  @AppStorage("lockScreenImmersiveCover")
+  var lockScreenImmersiveCover: Bool = false
+
+  @AppStorage("lockScreenShowRemainingInTitle")
+  var lockScreenShowRemainingInTitle: Bool = false
+
+  @AppStorage("timeRemainingAdjustsWithSpeed")
+  var timeRemainingAdjustsWithSpeed: Bool = true
+
+  @AppStorage("chapterProgressionAdjustsWithSpeed")
+  var chapterProgressionAdjustsWithSpeed: Bool = false
+
+  @AppStorage("playbackSpeed")
+  var defaultPlaybackSpeed: Double = 1.0
+
+  @AppStorage("showFullBookDuration")
+  var showFullBookDuration: Bool = false
+
+  @AppStorage("showBookProgressBar")
+  var showBookProgressBar: Bool = false
+
+  @AppStorage("hideChapterSkipButtons")
+  var hideChapterSkipButtons: Bool = false
+
+  @AppStorage("coverColorProgressBar")
+  var coverColorProgressBar: Bool = true
+
+  @AppStorage("playerBackgroundStyle")
+  var playerBackgroundStyle: PlayerBackgroundStyle = .solid
+
+  @AppStorage("showSystemVolumeSlider")
+  var showSystemVolumeSlider: Bool = false
+
+  @AppStorage("keepScreenAwakeInPlayer")
+  var keepScreenAwakeInPlayer: Bool = false
+
+  /// Clean raw ASR transcripts with the on-device model while the transcript is open. Off by
+  /// default: a full book is 1–2h of sustained ANE generation, which is a battery decision the
+  /// user makes, not us. The manual "Clean Up Text" button works regardless of this.
+  @AppStorage("transcriptCleanupWhileListening")
+  var transcriptCleanupWhileListening: Bool = false
+
+  /// Replace the player's album art with the streaming transcript (karaoke cover mode).
+  /// Toggled from the cover's long-press menu, persisted so the choice survives relaunches.
+  @AppStorage("playerKaraokeCover")
+  var playerKaraokeCover: Bool = false
+  @AppStorage("positionSyncOffers")
+  var positionSyncOffers: Bool = true
+
+  @AppStorage("mixWithOtherAudio")
+  var mixWithOtherAudio: Bool = false
+
+  @AppStorage("pauseAtZeroVolume")
+  var pauseAtZeroVolume: Bool = true
+
+  @AppStorage("volumeLevel")
+  var volumeLevel: Double = 1.0
+
+  @AppStorage("equalizerSettings")
+  var equalizerSettings: EqualizerSettings = .init()
+
+  @AppStorage("levelingStrength")
+  var levelingStrength: LevelingStrength = .off
+
+  @AppStorage("libraryDisplayMode")
+  var libraryDisplayMode: BookCard.DisplayMode = .card
+
+  @AppStorage("collapseSeriesInLibrary")
+  var collapseSeriesInLibrary: Bool = false
+
+  @AppStorage("showBookSubtitle")
+  var showBookSubtitle: Bool = false
+
+  @AppStorage("cardMinimalMode")
+  var cardMinimalMode: Bool = false
+
+  @AppStorage("cardCoverDynamicRatio")
+  var cardCoverDynamicRatio: Bool = false
+
+  @AppStorage("cardCoverCornerRadius")
+  var cardCoverCornerRadius: CardCornerRadius = .medium
+
+  @AppStorage("cardCoverBorderWidth")
+  var cardCoverBorderWidth: CardBorderWidth = .small
+
+  @AppStorage("dimCoverWhenCompleted")
+  var dimCoverWhenCompleted: Bool = true
+
+  @AppStorage("showContinueTimeRemaining")
+  var showContinueTimeRemaining: Bool = true
+
+  @AppStorage("groupSeriesInOffline")
+  var groupSeriesInOffline: Bool = false
+
+  @AppStorage("offlineSortOrder")
+  var offlineSortOrder: OfflineListView.Model.SortOrder = .manual
+
+  @AppStorage("offlineSortAscending")
+  var offlineSortAscending: Bool = true
+
+  @AppStorage("librarySortBy")
+  var librarySortBy: SortBy = .title
+
+  @AppStorage("librarySortAscending")
+  var librarySortAscending: Bool = true
+
+  @AppStorage("bookmarkSortBy")
+  var bookmarkSortBy: BookmarkViewerSheet.Model.SortBy = .time
+
+  @AppStorage("bookmarkSortAscending")
+  var bookmarkSortAscending: Bool = true
+
+  @AppStorage("libraryFilter")
+  var libraryFilter: FilterPicker.Model.Filter = .all
+
+  @AppStorage("showNFCTagWriting")
+  var showNFCTagWriting: Bool = false
+
+  @AppStorage("showDebugSection")
+  var showDebugSection: Bool = false
+
+  @AppStorage("iCloudSyncEnabled")
+  var iCloudSyncEnabled: Bool = false
+
+  @AppStorage("accentColor")
+  var accentColor: Color?
+
+  @AppStorage("autoTimerMode")
+  var autoTimerMode: AutoTimerMode = .off
+
+  @AppStorage("autoTimerWindowStart")
+  var autoTimerWindowStart: Int = 22 * 60
+
+  @AppStorage("autoTimerWindowEnd")
+  var autoTimerWindowEnd: Int = 6 * 60
+
+  @AppStorage("autoTimerTrigger")
+  var autoTimerTrigger: AutoTimerTrigger = .timeWindow
+
+  @AppStorage("playerOrientation")
+  var playerOrientation: PlayerOrientation = .auto
+
+  @AppStorage("colorScheme")
+  var colorScheme: ColorSchemeMode = .auto
+
+  @AppStorage("appTheme")
+  var appTheme: AppTheme = .sepia
+
+  @AppStorage("continueSectionSize")
+  var continueSectionSize: ContinueSectionSize = .default
+
+  @AppStorage("continueListeningStyle")
+  var continueListeningStyle: ContinueListeningStyle = .carousel
+
+  @AppStorage("showUsernameGreeting")
+  var showUsernameGreeting: Bool = true
+
+  @AppStorage("autoPlayNextInQueue")
+  var autoPlayNextInQueue: Bool = true
+
+  @AppStorage("continueNextInSeries")
+  var continueNextInSeries: Bool = true
+
+  @AppStorage("continueNextDownloadedBook")
+  var continueNextDownloadedBook: Bool = true
+
+  @AppStorage("continueNextPodcastEpisode")
+  var continueNextPodcastEpisode: Bool = true
+
+  @AppStorage("podcastAutoQueueSettings")
+  var podcastAutoQueueSettings: PodcastAutoQueueStore = .init()
+
+  @AppStorage("keepOfflineMode")
+  var keepOfflineMode: AutoDownloadMode = .off
+
+  @AppStorage("keepOfflineCount")
+  var keepOfflineCount: Int = 2
+
+  @AppStorage("autoDownloadQueuedEpisodes")
+  var autoDownloadQueuedEpisodes: Bool = false
+
+  @AppStorage("podcastEpisodeFilter")
+  var podcastEpisodeFilter: PodcastDetailsView.Model.EpisodeFilter = .all
+
+  @AppStorage("podcastEpisodeSort")
+  var podcastEpisodeSort: PodcastDetailsView.Model.EpisodeSort = .pubDate
+
+  @AppStorage("podcastEpisodeSortAscending")
+  var podcastEpisodeSortAscending: Bool = false
+
+  @AppStorage("authorsSortBy")
+  var authorsSortBy: AuthorsService.SortBy = .name
+
+  @AppStorage("authorsSortAscending")
+  var authorsSortAscending: Bool = true
+
+  @AppStorage("openPlayerOnLaunch")
+  var openPlayerOnLaunch: Bool = false
+
+  @AppStorage("assistedPlayer")
+  var assistedPlayer: Bool = false
+
+  @AppStorage("hapticsEnabled")
+  var hapticsEnabled: Bool = true
+
+  @AppStorage("dailyGoalMinutes")
+  var dailyGoalMinutes: Int = 0
+
+  #if targetEnvironment(macCatalyst)
+  @AppStorage("displayScale")
+  var displayScale: Double = 1.0
+  #endif
+
+  #if CONTRIBUTOR_BUILD
+  let cloud: NSUbiquitousKeyValueStore? = nil
+  #else
+  let cloud: NSUbiquitousKeyValueStore? = .default
+  #endif
+  var cloudObserver: NSObjectProtocol?
+  var localObserver: NSObjectProtocol?
+  var isApplyingCloudChanges = false
+
+  private init() {
+    migrateShowListeningStats()
+    migrateAutoDownloadBooks()
+    migrateShakeToExtendTimer()
+    migrateAutoTimerDuration()
+    migrateVolumeBoost()
+    migrateSmartContinuePlayback()
+    migrateOfflineSortOrder()
+    setupCloudSync()
+  }
+
+  private func migrateShowListeningStats() {
+    if UserDefaults.standard.bool(forKey: "showListeningStats") == true {
+      UserDefaults.standard.removeObject(forKey: "showListeningStats")
+
+      homeSections.insert(.listeningStats, at: 0)
+    }
+  }
+
+  private func migrateAutoDownloadBooks() {
+    if UserDefaults.standard.object(forKey: "autoDownloadBooks") is Bool {
+      let wasEnabled = UserDefaults.standard.bool(forKey: "autoDownloadBooks")
+      UserDefaults.standard.removeObject(forKey: "autoDownloadBooks")
+      autoDownloadBooks = wasEnabled ? .wifiAndCellular : .off
+    }
+  }
+
+  private func migrateShakeToExtendTimer() {
+    if UserDefaults.standard.object(forKey: "shakeToExtendTimer") is Bool {
+      let wasEnabled = UserDefaults.standard.bool(forKey: "shakeToExtendTimer")
+      UserDefaults.standard.removeObject(forKey: "shakeToExtendTimer")
+      shakeSensitivity = wasEnabled ? .medium : .off
+    }
+  }
+
+  private func migrateAutoTimerDuration() {
+    if let duration = UserDefaults.standard.object(forKey: "autoTimerDuration") as? TimeInterval {
+      UserDefaults.standard.removeObject(forKey: "autoTimerDuration")
+      if duration > 0 {
+        autoTimerMode = .duration(duration)
+      }
+    }
+  }
+
+  private func migrateSmartContinuePlayback() {
+    guard UserDefaults.standard.object(forKey: "smartContinuePlayback") is Bool else { return }
+
+    let wasEnabled = UserDefaults.standard.bool(forKey: "smartContinuePlayback")
+    UserDefaults.standard.removeObject(forKey: "smartContinuePlayback")
+
+    continueNextInSeries = wasEnabled
+    continueNextDownloadedBook = wasEnabled
+    continueNextPodcastEpisode = wasEnabled
+  }
+
+  private func migrateOfflineSortOrder() {
+    switch UserDefaults.standard.string(forKey: "offlineSortOrder") {
+    case "newest":
+      offlineSortOrder = .downloadDate
+      offlineSortAscending = false
+    case "oldest":
+      offlineSortOrder = .downloadDate
+      offlineSortAscending = true
+    default:
+      break
+    }
+  }
+
+  private func migrateVolumeBoost() {
+    guard let rawValue = UserDefaults.standard.string(forKey: "volumeBoost") else { return }
+    UserDefaults.standard.removeObject(forKey: "volumeBoost")
+
+    switch rawValue {
+    case "none": volumeLevel = 1.0
+    case "low": volumeLevel = 1.5
+    case "medium": volumeLevel = 2.0
+    case "high": volumeLevel = 3.0
+    default: break
+    }
+  }
+}
+
+extension UserPreferences {
+  func podcastAutoQueueSetting(for podcastID: String) -> PodcastAutoQueueSettings {
+    podcastAutoQueueSettings.settings[podcastID] ?? PodcastAutoQueueSettings()
+  }
+
+  func setPodcastAutoQueueSetting(_ setting: PodcastAutoQueueSettings, for podcastID: String) {
+    var store = podcastAutoQueueSettings
+    if !setting.position.isEnabled {
+      store.settings.removeValue(forKey: podcastID)
+    } else {
+      store.settings[podcastID] = setting
+    }
+    podcastAutoQueueSettings = store
+  }
+}
+
+extension Array: @retroactive RawRepresentable where Element: Codable {
+  public init?(rawValue: String) {
+    guard let data = rawValue.data(using: .utf8),
+      let result = try? JSONDecoder().decode([Element].self, from: data)
+    else {
+      return nil
+    }
+    self = result
+  }
+
+  public var rawValue: String {
+    guard let data = try? JSONEncoder().encode(self),
+      let result = String(data: data, encoding: .utf8)
+    else {
+      return "[]"
+    }
+    return result
+  }
+}
+
+enum AutoDownloadMode: String, CaseIterable, Codable {
+  case off
+  case wifiOnly
+  case wifiAndCellular
+
+  var displayName: LocalizedStringResource {
+    switch self {
+    case .off: "Off"
+    case .wifiOnly: "Wi-Fi Only"
+    case .wifiAndCellular: "Wi-Fi & Cellular"
+    }
+  }
+
+  var isNetworkAllowed: Bool {
+    switch self {
+    case .off: false
+    case .wifiOnly: NetworkMonitor.shared.interfaceType == .wifi
+    case .wifiAndCellular: NetworkMonitor.shared.isConnected
+    }
+  }
+}
+
+enum AutoDownloadDelay: Int, CaseIterable {
+  case none = 0
+  case oneMinute = 60
+  case fiveMinutes = 300
+  case tenMinutes = 600
+  case thirtyMinutes = 1800
+  case oneHour = 3600
+
+  var displayName: String {
+    switch self {
+    case .none: String(localized: "None")
+    default:
+      Duration.seconds(rawValue).formatted(.units(allowed: [.hours, .minutes], width: .wide))
+    }
+  }
+}
+
+enum RemoveAfterUnused: Int, CaseIterable {
+  case never = 0
+  case oneDay = 1
+  case fiveDays = 5
+  case sevenDays = 7
+  case fourteenDays = 14
+  case thirtyDays = 30
+  case ninetyDays = 90
+  case oneHundredEightyDays = 180
+
+  var displayName: LocalizedStringResource {
+    guard self != .never else { return "Never" }
+    return "^[\(rawValue) Day](inflect: true)"
+  }
+}
+
+enum ShakeSensitivity: String, CaseIterable {
+  case off
+  case veryLow
+  case low
+  case medium
+  case high
+  case veryHigh
+
+  var threshold: Double {
+    switch self {
+    case .off: return 0
+    case .veryLow: return 2.7
+    case .low: return 2.0
+    case .medium: return 1.5
+    case .high: return 1.3
+    case .veryHigh: return 1.1
+    }
+  }
+
+  var isEnabled: Bool {
+    self != .off
+  }
+
+  var displayText: LocalizedStringResource {
+    switch self {
+    case .off: "Off"
+    case .veryLow: "Very Low"
+    case .low: "Low"
+    case .medium: "Medium"
+    case .high: "High"
+    case .veryHigh: "Very High"
+    }
+  }
+}
+
+enum AutoTimerMode: Codable, Equatable, Hashable {
+  case off
+  case duration(TimeInterval)
+  case chapters(Int)
+}
+
+extension AutoTimerMode: RawRepresentable {
+  init?(rawValue: String) {
+    let components = rawValue.components(separatedBy: ":")
+    guard let type = components.first else { return nil }
+
+    switch type {
+    case "off":
+      self = .off
+    case "duration":
+      guard components.count == 2, let duration = TimeInterval(components[1]) else { return nil }
+      self = .duration(duration)
+    case "chapters":
+      guard components.count == 2, let count = Int(components[1]) else { return nil }
+      self = .chapters(count)
+    default:
+      return nil
+    }
+  }
+
+  var rawValue: String {
+    switch self {
+    case .off:
+      return "off"
+    case .duration(let duration):
+      return "duration:\(duration)"
+    case .chapters(let count):
+      return "chapters:\(count)"
+    }
+  }
+}
+
+enum AutoTimerTrigger: String, CaseIterable {
+  case timeWindow
+  case focus
+  case either
+
+  var displayText: LocalizedStringResource {
+    switch self {
+    case .timeWindow: "Time Window"
+    case .focus: "Focus"
+    case .either: "Either"
+    }
+  }
+}
+
+enum TimerPauseBehavior: String, CaseIterable {
+  case none
+  case pause
+  case reset
+  case off
+
+  var displayText: LocalizedStringResource {
+    switch self {
+    case .none: "None"
+    case .pause: "Pause"
+    case .reset: "Reset"
+    case .off: "Off"
+    }
+  }
+
+  var explanation: LocalizedStringResource {
+    switch self {
+    case .none: "Timer keeps counting down while playback is paused."
+    case .pause: "Timer pauses with playback and resumes on play."
+    case .reset: "Timer stops with playback and restarts in full on play."
+    case .off: "Pausing playback turns the sleep timer off."
+    }
+  }
+}
+
+enum PlayerOrientation: String, CaseIterable {
+  case auto
+  case portrait
+  case landscape
+
+  var displayText: LocalizedStringResource {
+    switch self {
+    case .auto: "Auto"
+    case .portrait: "Portrait"
+    case .landscape: "Landscape"
+    }
+  }
+}
+
+enum PlayerBackgroundStyle: String, CaseIterable {
+  case gradient
+  case solid
+  case off
+
+  var displayText: LocalizedStringResource {
+    switch self {
+    case .gradient: "Gradient"
+    case .solid: "Solid"
+    case .off: "Off"
+    }
+  }
+}
+
+enum ColorSchemeMode: String, CaseIterable {
+  case auto
+  case light
+  case dark
+
+  var displayText: LocalizedStringResource {
+    switch self {
+    case .auto: "Auto"
+    case .light: "Light"
+    case .dark: "Dark"
+    }
+  }
+
+  var colorScheme: ColorScheme? {
+    switch self {
+    case .auto: nil
+    case .light: .light
+    case .dark: .dark
+    }
+  }
+}
+
+struct EqualizerSettings: Equatable, RawRepresentable {
+  var isEnabled: Bool
+  var preamp: Float
+  var bandGains: [Float]
+
+  init(
+    isEnabled: Bool = false,
+    preamp: Float = 0,
+    bandGains: [Float] = [Float](repeating: 0, count: 7)
+  ) {
+    self.isEnabled = isEnabled
+    self.preamp = preamp
+    self.bandGains = bandGains
+  }
+
+  init?(rawValue: String) {
+    let parts = rawValue.components(separatedBy: "|")
+    guard parts.count == 3 else { return nil }
+    self.isEnabled = parts[0] == "1"
+    self.preamp = Float(parts[1]) ?? 0
+    var gains = parts[2].components(separatedBy: ",").compactMap { Float($0) }
+    if gains.count == 6 { gains.insert(0, at: 5) }
+    guard gains.count == 7 else { return nil }
+    self.bandGains = gains
+  }
+
+  var rawValue: String {
+    let enabled = isEnabled ? "1" : "0"
+    let gains = bandGains.map { String($0) }.joined(separator: ",")
+    return "\(enabled)|\(preamp)|\(gains)"
+  }
+}
+
+enum LevelingStrength: Int, CaseIterable, Identifiable, Codable {
+  case off
+  case low
+  case medium
+  case high
+
+  var id: Int { rawValue }
+
+  var displayName: LocalizedStringResource {
+    switch self {
+    case .off: "None"
+    case .low: "Low"
+    case .medium: "Medium"
+    case .high: "High"
+    }
+  }
+}
+
+enum ContinueListeningStyle: String, CaseIterable {
+  case carousel
+  case coverFlow
+
+  var displayText: LocalizedStringResource {
+    switch self {
+    case .carousel: "Carousel"
+    case .coverFlow: "Cover Flow"
+    }
+  }
+}
+
+enum ContinueSectionSize: Int, CaseIterable {
+  case `default` = 120
+  case large = 160
+  case extraLarge = 200
+
+  var value: CGFloat { CGFloat(rawValue) }
+
+  var episodeCardWidth: CGFloat {
+    switch self {
+    case .default: 200
+    case .large: 240
+    case .extraLarge: 280
+    }
+  }
+
+  var displayText: LocalizedStringResource {
+    switch self {
+    case .default: "Default"
+    case .large: "Large"
+    case .extraLarge: "Extra Large"
+    }
+  }
+}

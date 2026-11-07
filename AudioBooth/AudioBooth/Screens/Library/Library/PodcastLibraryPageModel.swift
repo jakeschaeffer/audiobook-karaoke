@@ -1,0 +1,213 @@
+import API
+import Foundation
+
+final class PodcastLibraryPageModel: LibraryPage.Model {
+  private let audiobookshelf = Audiobookshelf.shared
+
+  private var fetched: [LibraryView.Item] = []
+  private var sortBy: SortBy = .title
+  private var filter: FilterPicker.Model.Filter?
+
+  private var currentPage: Int = 0
+  private var isLoadingNextPage: Bool = false
+  private let itemsPerPage: Int = 100
+  private var loadTask: Task<Void, Never>?
+
+  init() {
+    let preferences = UserPreferences.shared
+    self.filter = preferences.libraryFilter == .all ? nil : preferences.libraryFilter
+
+    super.init(
+      hasMorePages: true,
+      isRoot: true,
+      sortOptions: SortBy.podcastOptions,
+      currentSort: .title,
+      title: "Podcasts"
+    )
+
+    kind = .podcasts
+    self.filters = FilterPickerModel(currentFilter: filter, source: .podcasts)
+  }
+
+  init(destination: NavigationDestination) {
+    switch destination {
+    case .genre(let name, _):
+      self.filter = .genres(name)
+      super.init(
+        hasMorePages: true,
+        isRoot: false,
+        title: name
+      )
+    case .tag(let name, _):
+      self.filter = .tags(name)
+      super.init(
+        hasMorePages: true,
+        isRoot: false,
+        title: name
+      )
+    default:
+      fatalError("PodcastLibraryPageModel cannot be initialized with a \(destination) destination")
+    }
+
+    kind = .podcasts
+  }
+
+  override func onAppear() {
+    guard fetched.isEmpty, loadTask == nil else { return }
+
+    loadTask = Task {
+      await loadPodcasts()
+    }
+  }
+
+  override func refresh() async {
+    loadTask?.cancel()
+    loadTask = nil
+    isLoading = true
+    isLoadingNextPage = false
+    currentPage = 0
+    hasMorePages = true
+    fetched.removeAll()
+    items.removeAll()
+
+    await filters?.refresh()
+    await loadPodcasts()
+  }
+
+  override func onSortOptionTapped(_ sortBy: SortBy) {
+    if self.sortBy == sortBy {
+      ascending.toggle()
+    } else {
+      self.sortBy = sortBy
+      currentSort = sortBy
+      ascending = true
+    }
+
+    Task {
+      await refresh()
+    }
+  }
+
+  override func onSearchChanged(_ searchText: String) {
+    if searchText.isEmpty {
+      items = fetched
+    } else {
+      let searchTerm = searchText.lowercased()
+      items = fetched.filter { item in
+
+        let title: String =
+          switch item {
+          case .book(let model): model.title
+          case .series(let model): model.title
+          }
+
+        return title.lowercased().contains(searchTerm)
+      }
+    }
+  }
+
+  override func loadNextPageIfNeeded() {
+    guard loadTask == nil else { return }
+    loadTask = Task {
+      await loadPodcasts()
+    }
+  }
+
+  override func onDisplayModeTapped() {
+    let preferences = UserPreferences.shared
+    preferences.libraryDisplayMode = preferences.libraryDisplayMode == .card ? .row : .card
+  }
+
+  override func onFilterButtonTapped() {
+    showingFilterSelection = true
+  }
+
+  override func onFilterPreferenceChanged(_ newFilter: FilterPicker.Model.Filter) {
+    let resolved = newFilter == .all ? nil : newFilter
+    guard filter != resolved else { return }
+
+    filter = resolved
+
+    Task {
+      await refresh()
+    }
+  }
+
+  private func loadPodcasts() async {
+    guard hasMorePages && !isLoadingNextPage else { return }
+
+    isLoadingNextPage = true
+    isLoading = currentPage == 0
+
+    do {
+      let filterString: String?
+
+      switch filter {
+      case .genres(let name):
+        let encoded = Data(name.utf8).base64EncodedString()
+        filterString = "genres.\(encoded)"
+      case .tags(let name):
+        let encoded = Data(name.utf8).base64EncodedString()
+        filterString = "tags.\(encoded)"
+      case .languages(let name):
+        let encoded = Data(name.utf8).base64EncodedString()
+        filterString = "languages.\(encoded)"
+      case .progress(let name):
+        let id = name.lowercased().replacingOccurrences(of: " ", with: "-")
+        let encoded = Data(id.utf8).base64EncodedString()
+        filterString = "progress.\(encoded)"
+      case .explicit:
+        filterString = "explicit"
+      case .all, nil:
+        filterString = nil
+      default:
+        filterString = nil
+      }
+
+      let response = try await audiobookshelf.podcasts.fetch(
+        limit: itemsPerPage,
+        page: currentPage,
+        sortBy: sortBy,
+        ascending: ascending,
+        filter: filterString
+      )
+
+      guard !Task.isCancelled else {
+        isLoadingNextPage = false
+        isLoading = false
+        return
+      }
+
+      let newItems: [LibraryView.Item] = response.results.map { podcast in
+        .book(PodcastCardModel(podcast, sortBy: sortBy))
+      }
+
+      if currentPage == 0 {
+        fetched = newItems
+      } else {
+        fetched.append(contentsOf: newItems)
+      }
+
+      items = fetched
+
+      currentPage += 1
+      totalCount = response.total
+      hasMorePages = (currentPage * itemsPerPage) < response.total
+    } catch {
+      guard !Task.isCancelled else {
+        isLoadingNextPage = false
+        isLoading = false
+        return
+      }
+
+      if currentPage == 0 {
+        fetched = []
+        items = []
+      }
+    }
+
+    isLoadingNextPage = false
+    isLoading = false
+    loadTask = nil
+  }
+}

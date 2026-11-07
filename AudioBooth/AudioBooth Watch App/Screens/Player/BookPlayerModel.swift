@@ -1,0 +1,628 @@
+import AVFoundation
+import Combine
+import Foundation
+import MediaPlayer
+import OSLog
+import WidgetKit
+
+final class BookPlayerModel: PlayerView.Model {
+  let bookID: String
+
+  private let connectivityManager = WatchConnectivityManager.shared
+  private let localStorage = LocalBookStorage.shared
+  private let audioPlayer = WatchAudioPlayer()
+  private var cancellables = Set<AnyCancellable>()
+
+  private(set) var book: WatchBook
+  private var localBook: WatchBook?
+  private var sessionID: String?
+  private var currentChapterIndex: Int = 0
+  private var totalDuration: Double = 0
+  private var lastProgressReportTime: Date?
+  private var progressSaveCounter: Int = 0
+  private var hasStartedPlayback = false
+
+  init(book: WatchBook) {
+    self.bookID = book.id
+
+    if let downloaded = localStorage.books.first(where: { $0.id == book.id }),
+      downloaded.isDownloaded
+    {
+      self.localBook = downloaded
+      var mergedBook = downloaded
+      if downloaded.coverURL == nil {
+        mergedBook.coverURL = book.coverURL
+      }
+      self.book = mergedBook
+    } else {
+      self.book = book
+    }
+
+    self.totalDuration = self.book.duration
+
+    super.init(
+      isPlaying: false,
+      playbackState: .loading,
+      isLocal: localBook != nil,
+      progress: self.book.progress,
+      current: self.book.currentTime,
+      remaining: self.book.timeRemaining,
+      totalTimeRemaining: self.book.timeRemaining,
+      title: self.book.title,
+      author: self.book.authorName,
+      coverURL: self.book.coverURL,
+      chapters: nil
+    )
+
+    audioPlayer.rate = BookSpeedPickerModel.savedSpeed
+
+    subscribeToPlayerEvents()
+    setupProgressObserver()
+    setupOptionsModel()
+    setupChapters()
+    load()
+  }
+
+  private func subscribeToPlayerEvents() {
+    audioPlayer.events
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] event in
+        self?.handlePlayerEvent(event)
+      }
+      .store(in: &cancellables)
+  }
+
+  private func handlePlayerEvent(_ event: WatchAudioPlayer.Event) {
+    switch event {
+    case .timeUpdate(let globalTime):
+      current = globalTime
+      remaining = max(0, totalDuration - globalTime)
+      progress = totalDuration > 0 ? globalTime / totalDuration : 0
+      totalTimeRemaining = remaining
+
+      updateCurrentChapter(currentTime: globalTime)
+      updateNowPlayingInfo()
+
+      guard hasStartedPlayback else { return }
+
+      progressSaveCounter += 1
+      if isPlaying {
+        reportProgressIfNeeded(currentTime: globalTime)
+      }
+
+      if isLocal && progressSaveCounter % 60 == 0 {
+        saveProgress(currentTime: globalTime)
+      }
+
+    case .stateChanged(let state):
+      switch state {
+      case .playing:
+        isPlaying = true
+        lastProgressReportTime = Date()
+        updateComplicationState()
+      case .paused:
+        if isPlaying {
+          reportProgressNow(currentTime: current)
+        }
+        isPlaying = false
+        updateComplicationState()
+      case .ready:
+        playbackState = .ready
+      case .buffering:
+        break
+      case .stopped:
+        isPlaying = false
+      case .error:
+        break
+      }
+
+    case .seek(let time):
+      current = time
+      updateCurrentChapter(currentTime: time)
+      updateComplicationState()
+
+    case .finished:
+      reportProgressNow(currentTime: current)
+      isPlaying = false
+      saveProgress(currentTime: current)
+      updateComplicationState()
+
+    case .stalled:
+      break
+
+    case .error(let error):
+      handlePlaybackError(error)
+    }
+  }
+
+  private func handlePlaybackError(_ error: Error?) {
+    if localBook != nil {
+      AppLogger.player.warning("Local playback failed, falling back to streaming.")
+      Task {
+        await handleCorruptedDownload()
+      }
+    } else {
+      let isNetworkError: Bool
+      if let error {
+        let nsError = error as NSError
+        isNetworkError = nsError.domain == NSURLErrorDomain || nsError.code == -1009
+      } else {
+        isNetworkError = false
+      }
+      playbackState = .error(retryable: isNetworkError)
+      errorMessage =
+        isNetworkError ? String(localized: "Network error. Tap to retry.") : String(localized: "Playback failed.")
+    }
+  }
+
+  private func setupOptionsModel() {
+    let optionsModel = BookPlayerOptionsModel(
+      playerModel: self,
+      hasChapters: !book.chapters.isEmpty
+    )
+    options = optionsModel
+  }
+
+  private func setupChapters() {
+    guard !book.chapters.isEmpty else { return }
+
+    currentChapterIndex = chapterIndex(at: current)
+    let chapterModels = BookChapterPickerModel(
+      chapters: book.chapters,
+      playerModel: self,
+      currentIndex: currentChapterIndex
+    )
+    chapters = chapterModels
+    options.hasChapters = true
+  }
+
+  private func chapterIndex(at time: Double) -> Int {
+    book.chapters.firstIndex { time >= $0.start && time < $0.end } ?? 0
+  }
+
+  private func load() {
+    seek(to: book.progress >= 1.0 ? 0 : book.currentTime)
+    playbackState = .ready
+
+    if localBook == nil {
+      loadBookDetails()
+    }
+  }
+
+  private func loadBookDetails() {
+    guard book.chapters.isEmpty else { return }
+
+    Task {
+      guard let info = await connectivityManager.startSession(for: book, forDownload: true),
+        !hasStartedPlayback
+      else { return }
+
+      book.chapters = info.chapters
+      setupChapters()
+      seek(to: current)
+    }
+  }
+
+  private func startPlayback() {
+    syncToLatestKnownProgressIfNeeded()
+    hasStartedPlayback = true
+    PlayerManager.shared.activate(self)
+
+    Task {
+      if localBook != nil {
+        await playLocalBook()
+      } else {
+        await startSessionAndPlay()
+      }
+    }
+  }
+
+  private func playLocalBook() async {
+    await configureAudioSession()
+    preparePlayerWithLocalBook()
+    audioPlayer.resume(at: current)
+    setupRemoteCommandCenter()
+    startSessionInBackground()
+  }
+
+  private func seek(to time: Double) {
+    if hasStartedPlayback {
+      audioPlayer.seek(to: time)
+    } else {
+      handlePlayerEvent(.timeUpdate(time))
+    }
+  }
+
+  private func startSessionInBackground() {
+    guard connectivityManager.isReachable else { return }
+
+    Task {
+      guard let info = await connectivityManager.startSession(for: book) else {
+        AppLogger.player.warning("Failed to start session for progress reporting")
+        return
+      }
+      self.sessionID = info.sessionID
+      AppLogger.player.info("Session started for progress reporting: \(info.sessionID ?? "nil")")
+    }
+  }
+
+  private func startSessionAndPlay() async {
+    playbackState = .loading
+
+    AppLogger.player.info(
+      "Loading book info for \(self.bookID), isReachable: \(self.connectivityManager.isReachable)"
+    )
+
+    guard let info = await connectivityManager.startSession(for: book) else {
+      AppLogger.player.error("Failed to start session for streaming")
+      playbackState = .error(retryable: true)
+      errorMessage = String(localized: "Failed to connect. Tap to retry.")
+      return
+    }
+
+    AppLogger.player.info(
+      "Got book info: \(info.tracks.count) tracks, \(info.chapters.count) chapters"
+    )
+
+    let startsFromBeginning = current == 0 && book.currentTime == 0
+    self.sessionID = info.sessionID
+    self.book = info
+
+    if !info.chapters.isEmpty && chapters == nil {
+      currentChapterIndex = chapterIndex(at: current)
+      let chapterModels = BookChapterPickerModel(
+        chapters: info.chapters,
+        playerModel: self,
+        currentIndex: currentChapterIndex
+      )
+      chapters = chapterModels
+      options.hasChapters = true
+    }
+
+    await configureAudioSession()
+
+    audioPlayer.prepare(tracks: info.tracks) { track in
+      track.url
+    }
+    audioPlayer.resume(at: startsFromBeginning && info.progress < 1 ? info.currentTime : current)
+    setupRemoteCommandCenter()
+  }
+
+  private func preparePlayerWithLocalBook() {
+    guard let localBook else { return }
+
+    audioPlayer.prepare(tracks: localBook.tracks) { track in
+      localBook.localURL(for: track)
+    }
+  }
+
+  private func configureAudioSession() async {
+    do {
+      let audioSession = AVAudioSession.sharedInstance()
+      try audioSession.setCategory(
+        .playback,
+        mode: .spokenAudio,
+        policy: .longFormAudio,
+        options: []
+      )
+      try await audioSession.activate()
+      AppLogger.player.info("Audio session activated")
+    } catch {
+      AppLogger.player.error("Failed to configure audio session: \(error)")
+    }
+  }
+
+  override func togglePlayback() {
+    if isPlaying {
+      audioPlayer.pause()
+    } else if !hasStartedPlayback {
+      startPlayback()
+    } else {
+      syncToLatestKnownProgressIfNeeded()
+      audioPlayer.resume()
+    }
+  }
+
+  override func skipForward() {
+    let newTime = min(current + connectivityManager.skipForwardInterval, totalDuration)
+    seek(to: newTime)
+  }
+
+  override func skipBackward() {
+    let newTime = max(current - connectivityManager.skipBackwardInterval, 0)
+    seek(to: newTime)
+  }
+
+  override func stop() {
+    if isPlaying {
+      reportProgressNow(currentTime: current)
+    }
+    audioPlayer.stop()
+    saveProgress(currentTime: current)
+    releaseNowPlaying()
+  }
+
+  private func releaseNowPlaying() {
+    guard hasStartedPlayback else { return }
+
+    let commandCenter = MPRemoteCommandCenter.shared()
+    commandCenter.playCommand.removeTarget(nil)
+    commandCenter.pauseCommand.removeTarget(nil)
+    commandCenter.skipForwardCommand.removeTarget(nil)
+    commandCenter.skipBackwardCommand.removeTarget(nil)
+
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+  }
+
+  func playOnPhone() {
+    guard connectivityManager.isReachable else {
+      errorMessage = String(localized: "iPhone not reachable.\nOpen AudioBooth on your iPhone and try again.")
+      return
+    }
+
+    let currentTime = current
+    PlayerManager.shared.clearCurrent()
+    connectivityManager.playOnPhone(book, currentTime: currentTime)
+    PlayerManager.shared.isShowingFullPlayer = false
+  }
+
+  func changeSpeed(_ speed: Float) {
+    audioPlayer.rate = speed
+    updateComplicationState()
+  }
+
+  override func onDownloadTapped() {
+    guard let options = options as? BookPlayerOptionsModel else { return }
+    options.onDownloadTapped()
+  }
+
+  override func retry() {
+    AppLogger.player.info("Retrying playback for \(self.bookID)")
+    errorMessage = nil
+
+    audioPlayer.stop()
+
+    if localBook != nil {
+      Task {
+        await playLocalBook()
+      }
+    } else {
+      Task {
+        await startSessionAndPlay()
+      }
+    }
+  }
+
+  func switchToLocalPlayback(_ book: WatchBook) {
+    self.localBook = book
+    self.isLocal = true
+    AppLogger.player.info("Switched to local playback for \(self.bookID)")
+  }
+
+  func clearLocalPlayback() {
+    self.localBook = nil
+    self.isLocal = false
+  }
+
+  private func handleCorruptedDownload() async {
+    guard localBook != nil else { return }
+
+    AppLogger.player.info("Cleaning up corrupted download for \(self.bookID)")
+
+    audioPlayer.stop()
+
+    DownloadManager.shared.deleteDownload(for: bookID)
+
+    self.localBook = nil
+    self.isLocal = false
+
+    errorMessage = String(localized: "Download was corrupted. Streaming instead.")
+
+    await startSessionAndPlay()
+  }
+
+  func seekToChapter(at index: Int) {
+    let chapters = book.chapters
+    guard index >= 0, index < chapters.count else { return }
+
+    let chapter = chapters[index]
+
+    seek(to: chapter.start)
+
+    currentChapterIndex = index
+    self.chapters?.currentIndex = index
+
+    guard hasStartedPlayback else { return }
+
+    if isLocal {
+      saveProgress(currentTime: chapter.start)
+    }
+    reportProgressNow(currentTime: chapter.start)
+  }
+
+  private func setupRemoteCommandCenter() {
+    let commandCenter = MPRemoteCommandCenter.shared()
+
+    commandCenter.playCommand.removeTarget(nil)
+    commandCenter.pauseCommand.removeTarget(nil)
+    commandCenter.skipForwardCommand.removeTarget(nil)
+    commandCenter.skipBackwardCommand.removeTarget(nil)
+
+    commandCenter.playCommand.addTarget { [weak self] _ in
+      guard let self else { return .commandFailed }
+      syncToLatestKnownProgressIfNeeded()
+      audioPlayer.resume()
+      return .success
+    }
+
+    commandCenter.pauseCommand.addTarget { [weak self] _ in
+      self?.audioPlayer.pause()
+      return .success
+    }
+
+    commandCenter.skipForwardCommand.preferredIntervals = [
+      NSNumber(value: connectivityManager.skipForwardInterval)
+    ]
+    commandCenter.skipBackwardCommand.preferredIntervals = [
+      NSNumber(value: connectivityManager.skipBackwardInterval)
+    ]
+
+    commandCenter.skipForwardCommand.addTarget { [weak self] _ in
+      self?.skipForward()
+      return .success
+    }
+
+    commandCenter.skipBackwardCommand.addTarget { [weak self] _ in
+      self?.skipBackward()
+      return .success
+    }
+  }
+
+  private func updateCurrentChapter(currentTime: Double) {
+    let chapters = book.chapters
+    guard !chapters.isEmpty else {
+      chapterTitle = nil
+      return
+    }
+
+    for (index, chapter) in chapters.enumerated() {
+      if currentTime >= chapter.start && currentTime < chapter.end {
+        let chapterChanged = currentChapterIndex != index
+        if chapterChanged {
+          currentChapterIndex = index
+          self.chapters?.currentIndex = index
+        }
+
+        chapterTitle = chapter.title
+        chapterCurrent = currentTime - chapter.start
+        chapterRemaining = chapter.end - currentTime
+        let chapterDuration = chapter.end - chapter.start
+        chapterProgress = chapterDuration > 0 ? (currentTime - chapter.start) / chapterDuration : 0
+
+        if chapterChanged {
+          updateComplicationState()
+        }
+        return
+      }
+    }
+
+    chapterTitle = nil
+  }
+
+  private func saveProgress(currentTime: Double) {
+    localStorage.updateProgress(for: bookID, currentTime: currentTime)
+  }
+
+  private func reportProgressIfNeeded(currentTime: Double) {
+    let now = Date()
+    if let lastReport = lastProgressReportTime {
+      let timeSinceLastReport = now.timeIntervalSince(lastReport)
+      if timeSinceLastReport >= 30 {
+        connectivityManager.reportProgress(
+          bookID: book.id,
+          podcastID: book.podcastID,
+          sessionID: sessionID,
+          currentTime: currentTime,
+          timeListened: timeSinceLastReport,
+          duration: totalDuration
+        )
+        lastProgressReportTime = now
+      }
+    } else {
+      lastProgressReportTime = now
+    }
+  }
+
+  private func reportProgressNow(currentTime: Double) {
+    let now = Date()
+    let timeListened = lastProgressReportTime.map { now.timeIntervalSince($0) } ?? 0
+    connectivityManager.reportProgress(
+      bookID: book.id,
+      podcastID: book.podcastID,
+      sessionID: sessionID,
+      currentTime: currentTime,
+      timeListened: timeListened,
+      duration: self.totalDuration
+    )
+    lastProgressReportTime = now
+  }
+
+  private func updateComplicationState() {
+    guard hasStartedPlayback else { return }
+
+    let chapter =
+      chapterTitle != nil && book.chapters.indices.contains(currentChapterIndex)
+      ? book.chapters[currentChapterIndex]
+      : nil
+
+    let state = WatchComplicationState(
+      bookTitle: book.title,
+      progress: totalDuration > 0 ? current / totalDuration : 0,
+      chapterProgress: chapterProgress > 0 ? chapterProgress : nil,
+      currentTime: current,
+      duration: totalDuration,
+      isPlaying: isPlaying,
+      savedAt: Date(),
+      playbackRate: Double(audioPlayer.rate),
+      chapterStart: chapter?.start,
+      chapterEnd: chapter?.end,
+      chapterStarts: book.chapters.isEmpty ? nil : book.chapters.map(\.start),
+      bookID: book.id,
+      chapterTitles: book.chapters.isEmpty ? nil : book.chapters.map(\.title)
+    )
+    WatchComplicationStorage.save(state)
+    connectivityManager.updateComplicationCover(bookID: book.id, coverURL: book.coverURL)
+    WidgetCenter.shared.reloadAllTimelines()
+  }
+
+  private func updateNowPlayingInfo() {
+    guard hasStartedPlayback else { return }
+
+    var nowPlayingInfo = [String: Any]()
+    nowPlayingInfo[MPMediaItemPropertyTitle] = title
+    nowPlayingInfo[MPMediaItemPropertyArtist] = author
+    nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = totalDuration
+    nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = current
+    nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? Double(audioPlayer.rate) : 0.0
+
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+  }
+
+  private func setupProgressObserver() {
+    connectivityManager.$progress
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        self?.syncToLatestKnownProgressIfNeeded()
+      }
+      .store(in: &cancellables)
+
+    syncToLatestKnownProgressIfNeeded()
+  }
+
+  private func syncToLatestKnownProgressIfNeeded() {
+    guard
+      !isPlaying,
+      let latest = connectivityManager.progress[bookID],
+      abs(latest - current) > 0.5
+    else { return }
+
+    current = latest
+
+    let duration = max(totalDuration, book.duration, 1)
+    remaining = max(0, duration - latest)
+    progress = min(1, max(0, latest / duration))
+    totalTimeRemaining = remaining
+
+    seek(to: latest)
+  }
+
+  @MainActor
+  deinit {
+    if isPlaying {
+      reportProgressNow(currentTime: current)
+    }
+    audioPlayer.stop()
+    saveProgress(currentTime: current)
+  }
+}

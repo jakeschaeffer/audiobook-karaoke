@@ -1,0 +1,313 @@
+import API
+@preconcurrency import Foundation
+import SwiftData
+
+@Model
+public final class LocalBook {
+  @Attribute(.unique) public var bookID: String
+  public var libraryID: String?
+  public var title: String
+  public var authors: [Author]
+  public var narrators: [String]
+  public var series: [Series]
+  public var coverURL: URL?
+  public var duration: TimeInterval
+  public var tracks: [Track]
+  public var chapters: [Chapter]
+  public var publishedYear: String?
+  public var subtitle: String?
+  public var bookDescription: String?
+  public var genres: [String]?
+  public var tags: [String]?
+  public var isExplicit: Bool = false
+  public var isAbridged: Bool = false
+  public var publisher: String?
+  public var language: String?
+  public var displayOrder: Int = 0
+  public var createdAt: Date = Date()
+  public var downloadedAt: Date?
+  public var ebookFile: URL?
+  public var coverFile: URL?
+
+  public var authorNames: String {
+    authors.map(\.name).joined(separator: ", ")
+  }
+
+  public var mediaType: Book.MediaType {
+    var types: Book.MediaType = []
+    if !tracks.isEmpty {
+      types.insert(.audiobook)
+    }
+    if ebookFile != nil {
+      types.insert(.ebook)
+    }
+    return types
+  }
+
+  public var ebookLocalPath: URL? {
+    guard let ebookFile else { return nil }
+
+    guard
+      let appGroupURL = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: "group.me.jgrenier.audioBS"
+      )
+    else {
+      return nil
+    }
+
+    let fileURL = appGroupURL.appendingPathComponent(ebookFile.relativePath)
+    guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+    return fileURL
+  }
+
+  public var localCoverURL: URL? {
+    guard let coverFile else { return nil }
+
+    guard
+      let appGroupURL = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: "group.me.jgrenier.audioBS"
+      )
+    else {
+      return nil
+    }
+
+    let fileURL = appGroupURL.appendingPathComponent(coverFile.relativePath)
+    guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+    return fileURL
+  }
+
+  public func coverURL(raw: Bool = false) -> URL? {
+    if let localCoverURL { return localCoverURL }
+
+    guard var url = coverURL else { return nil }
+
+    #if os(watchOS)
+    url.append(queryItems: [URLQueryItem(name: "format", value: "jpeg")])
+    #else
+    if raw {
+      url.append(queryItems: [URLQueryItem(name: "raw", value: "1")])
+    }
+    #endif
+
+    return url
+  }
+
+  public init(
+    bookID: String,
+    libraryID: String? = nil,
+    title: String,
+    authors: [Author] = [],
+    narrators: [String] = [],
+    series: [Series] = [],
+    coverURL: URL? = nil,
+    duration: TimeInterval,
+    tracks: [Track] = [],
+    chapters: [Chapter] = [],
+    publishedYear: String? = nil,
+    subtitle: String? = nil,
+    bookDescription: String? = nil,
+    genres: [String]? = nil,
+    tags: [String]? = nil,
+    isExplicit: Bool = false,
+    isAbridged: Bool = false,
+    publisher: String? = nil,
+    language: String? = nil,
+    displayOrder: Int = Int(Date().timeIntervalSince1970 * 1000),
+    createdAt: Date = Date(),
+    downloadedAt: Date? = nil,
+    ebookFile: URL? = nil
+  ) {
+    self.bookID = bookID
+    self.libraryID = libraryID
+    self.title = title
+    self.authors = authors
+    self.narrators = narrators
+    self.series = series
+    self.coverURL = coverURL
+    self.duration = duration
+    self.tracks = tracks
+    self.chapters = chapters
+    self.publishedYear = publishedYear
+    self.subtitle = subtitle
+    self.bookDescription = bookDescription
+    self.genres = genres
+    self.tags = tags
+    self.isExplicit = isExplicit
+    self.isAbridged = isAbridged
+    self.publisher = publisher
+    self.language = language
+    self.displayOrder = displayOrder
+    self.createdAt = createdAt
+    self.downloadedAt = downloadedAt
+    self.ebookFile = ebookFile
+  }
+}
+
+@MainActor
+extension LocalBook {
+  public static func fetchAll() throws -> [LocalBook] {
+    let context = ModelContextProvider.shared.context
+    let descriptor = FetchDescriptor<LocalBook>()
+    return try context.fetch(descriptor)
+  }
+
+  public static func fetch(bookID: String) throws -> LocalBook? {
+    let context = ModelContextProvider.shared.context
+    let predicate = #Predicate<LocalBook> { item in
+      item.bookID == bookID
+    }
+    let descriptor = FetchDescriptor<LocalBook>(predicate: predicate)
+    return try context.fetch(descriptor).first
+  }
+
+  public func save() throws {
+    let context = ModelContextProvider.shared.context
+
+    guard modelContext == nil else {
+      try? context.save()
+      return
+    }
+
+    guard let existingItem = try LocalBook.fetch(bookID: bookID) else {
+      context.insert(self)
+      try? context.save()
+      return
+    }
+
+    let hasImportedNarration = existingItem.hasImportedNarration
+    let keepsImportedNarration = hasImportedNarration && tracks.isEmpty
+
+    if #unavailable(iOS 18, watchOS 11, tvOS 18, macOS 15) {
+      bookID = UUID().uuidString
+      context.insert(self)
+    }
+
+    existingItem.libraryID = libraryID
+    existingItem.title = title
+    existingItem.authors = authors
+    existingItem.narrators = narrators
+    existingItem.series = series
+    if existingItem.coverURL != coverURL {
+      existingItem.coverFile = nil
+    }
+    existingItem.coverURL = coverURL
+    if !keepsImportedNarration {
+      existingItem.duration = duration
+      existingItem.chapters = chapters
+    }
+    existingItem.publishedYear = publishedYear
+    existingItem.subtitle = subtitle
+    existingItem.bookDescription = bookDescription
+    existingItem.genres = genres
+    existingItem.tags = tags
+    existingItem.isExplicit = isExplicit
+    existingItem.isAbridged = isAbridged
+    existingItem.publisher = publisher
+    existingItem.language = language
+    existingItem.downloadedAt = downloadedAt ?? existingItem.downloadedAt
+    existingItem.ebookFile = ebookFile ?? existingItem.ebookFile
+    existingItem.coverFile = coverFile ?? existingItem.coverFile
+
+    if hasImportedNarration, !tracks.isEmpty {
+      if let directory = existingItem.tracks.first?.localPath?.deletingLastPathComponent() {
+        try? FileManager.default.removeItem(at: directory)
+      }
+      existingItem.tracks = tracks
+    } else if existingItem.tracks.allSatisfy({ $0.relativePath == nil }) {
+      existingItem.tracks = tracks
+    }
+
+    if #unavailable(iOS 18, watchOS 11, tvOS 18, macOS 15) {
+      context.delete(self)
+    }
+
+    try? context.save()
+  }
+
+  public func delete() throws {
+    let context = ModelContextProvider.shared.context
+    context.delete(self)
+    try? context.save()
+  }
+
+  public static func updateDisplayOrders(_ bookIDsInOrder: [String]) throws {
+    let context = ModelContextProvider.shared.context
+    for (index, bookID) in bookIDsInOrder.enumerated() {
+      if let book = try fetch(bookID: bookID) {
+        book.displayOrder = index
+      }
+    }
+    try? context.save()
+  }
+
+  public var orderedChapters: [Chapter] {
+    chapters.sorted(by: { $0.start < $1.start })
+  }
+
+  public var orderedTracks: [Track] {
+    tracks.sorted(by: { $0.index < $1.index })
+  }
+
+  public var hasImportedNarration: Bool {
+    tracks.contains { $0.relativePath?.pathComponents.contains("narration") == true }
+  }
+
+  public var isDownloaded: Bool {
+    if tracks.isEmpty {
+      return ebookFile != nil
+    }
+    return tracks.allSatisfy { track in track.relativePath != nil }
+  }
+
+  public convenience init(from book: Book) {
+    let authors =
+      book.media.metadata.authors?.map { apiAuthor in
+        Author(id: apiAuthor.id, name: apiAuthor.name)
+      } ?? []
+
+    let series =
+      book.media.metadata.series?.map { apiSeries in
+        Series(id: apiSeries.id, name: apiSeries.name, sequence: apiSeries.sequence)
+      } ?? []
+
+    let narrators = book.media.metadata.narrators ?? []
+
+    self.init(
+      bookID: book.id,
+      libraryID: book.libraryID,
+      title: book.title,
+      authors: authors,
+      narrators: narrators,
+      series: series,
+      coverURL: book.coverURL(),
+      duration: book.duration,
+      tracks: book.tracks?.map(Track.init) ?? [],
+      chapters: book.chapters?.map(Chapter.init) ?? [],
+      publishedYear: book.publishedYear,
+      subtitle: book.media.metadata.subtitle,
+      bookDescription: book.description,
+      genres: book.genres,
+      tags: book.tags,
+      isExplicit: book.media.metadata.explicit ?? false,
+      isAbridged: book.media.metadata.abridged ?? false,
+      publisher: book.publisher,
+      language: book.media.metadata.language
+    )
+  }
+}
+
+extension LocalBook: PlayableItem {
+  public var details: String { authorNames }
+}
+
+extension LocalBook: Comparable {
+  public static func < (lhs: LocalBook, rhs: LocalBook) -> Bool {
+    if lhs.displayOrder != rhs.displayOrder {
+      return lhs.displayOrder < rhs.displayOrder
+    } else if lhs.createdAt != rhs.createdAt {
+      return lhs.createdAt < rhs.createdAt
+    } else {
+      return lhs.title < rhs.title
+    }
+  }
+}

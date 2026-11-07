@@ -1,0 +1,705 @@
+import API
+import AVFoundation
+import BackgroundTasks
+import Combine
+import Foundation
+import Logging
+import MediaPlayer
+import Models
+import PlayerIntents
+import UIKit
+
+#if !targetEnvironment(macCatalyst)
+import ActivityKit
+#endif
+
+final class SessionManager {
+  static let shared = SessionManager()
+
+  private let taskIdentifier = "me.jgrenier.AudioBS.close-session"
+  private let sessionIDKey = "activeSessionID"
+  private let retryCountKey = "sessionCloseRetryCount"
+  private let inactivityTimeout: TimeInterval = 10 * 60
+  private let audiobookshelf = Audiobookshelf.shared
+
+  private(set) var current: PlaybackSession?
+  private var lastSyncAt = Date()
+  private var inactivityTask: Task<Void, Never>?
+  private var unsyncedSyncTask: Task<Void, Never>?
+  private var lastUnsyncedSyncAt = Date.distantPast
+  private var unsyncedSyncDelay: TimeInterval = 0
+  private var cancellables = Set<AnyCancellable>()
+
+  private init() {
+    registerBackgroundTask()
+
+    NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
+      .sink { [weak self] _ in
+        guard let player = PlayerManager.shared.current else { return }
+        if let podcastID = player.podcastID {
+          self?.refreshProgress(itemID: podcastID, episodeID: player.id)
+        } else {
+          self?.refreshProgress(itemID: player.id)
+        }
+      }
+      .store(in: &cancellables)
+  }
+
+  func clearSession() {
+    current = nil
+    UserDefaults.standard.set(0, forKey: retryCountKey)
+    cancelScheduledSessionClose()
+    cancelInactivityTask()
+  }
+
+  enum SessionError: Error {
+    case noActiveSession
+    case failedToCreateSession
+  }
+}
+
+extension SessionManager {
+  func ensureSession(
+    itemID: String,
+    episodeID: String? = nil,
+    item: (any PlayableItem)?,
+    mediaProgress: MediaProgress,
+    forceTranscode: Bool
+  ) async throws -> any PlayableItem {
+    let isSameItem = current?.libraryItemID == itemID && current?.episodeID == episodeID
+
+    if current != nil, !isSameItem {
+      AppLogger.session.info(
+        "Session exists for different item/episode, server will close old session when starting new one"
+      )
+      self.current = nil
+      cancelScheduledSessionClose()
+    }
+
+    if let item, let current, isSameItem {
+      if item.isDownloaded, current.isRemote {
+        AppLogger.session.info(
+          "Item is now downloaded, closing remote session to switch to local session"
+        )
+        try? await closeSession(isDownloaded: true)
+      } else {
+        AppLogger.session.debug(
+          "Session already exists for this book, reusing: \(current.id)"
+        )
+        return item
+      }
+    }
+
+    if let item, item.isDownloaded {
+      startLocalSession(
+        libraryItemID: itemID,
+        episodeID: episodeID,
+        item: item,
+        mediaProgress: mediaProgress
+      )
+      AppLogger.session.info("Created local session for offline stats tracking")
+      refreshProgress(itemID: itemID, episodeID: episodeID)
+      return item
+    }
+
+    do {
+      let result = try await startSession(
+        itemID: itemID,
+        episodeID: episodeID,
+        item: item,
+        mediaProgress: mediaProgress,
+        forceTranscode: forceTranscode
+      )
+      return result.updatedItem
+    } catch {
+      AppLogger.session.warning("Failed to create remote session: \(error)")
+      throw error
+    }
+  }
+
+  private func startSession(
+    itemID: String,
+    episodeID: String? = nil,
+    item: (any PlayableItem)?,
+    mediaProgress: MediaProgress,
+    forceTranscode: Bool
+  ) async throws -> (session: Session, updatedItem: any PlayableItem) {
+    AppLogger.session.info("Fetching session from server...")
+
+    let audiobookshelfSession = try await audiobookshelf.sessions.start(
+      itemID: itemID,
+      episodeID: episodeID,
+      forceTranscode: forceTranscode,
+      timeout: item == nil ? 30 : 10
+    )
+
+    guard let session = Session(from: audiobookshelfSession) else {
+      throw SessionError.failedToCreateSession
+    }
+
+    let updatedItem: any PlayableItem
+
+    if let item {
+      if let localBook = item as? LocalBook,
+        let sessionChapters = audiobookshelfSession.chapters, !sessionChapters.isEmpty
+      {
+        localBook.chapters = sessionChapters.map(Chapter.init)
+        try? localBook.save()
+      }
+      updatedItem = item
+      AppLogger.session.debug("Updated session with chapters")
+    } else if let episodeID = audiobookshelfSession.episodeId {
+      let podcast: Podcast
+      switch audiobookshelfSession.libraryItem {
+      case .podcast(let p): podcast = p
+      case .book: throw SessionError.failedToCreateSession
+      }
+
+      let localPodcast: LocalPodcast
+      if let existing = try? LocalPodcast.fetch(podcastID: podcast.id) {
+        existing.title = podcast.title
+        existing.author = podcast.author
+        existing.coverURL = podcast.coverURL()
+        localPodcast = existing
+      } else {
+        localPodcast = LocalPodcast(from: podcast)
+      }
+      try? localPodcast.save()
+
+      let episode = podcast.media.episodes?.first { $0.id == episodeID }
+      let newItem = LocalEpisode(
+        episodeID: episodeID,
+        podcast: localPodcast,
+        title: episode?.title ?? podcast.title,
+        duration: audiobookshelfSession.duration,
+        season: episode?.season,
+        episode: episode?.episode,
+        coverURL: podcast.coverURL(),
+        track: audiobookshelfSession.audioTracks?.first.map(Track.init),
+        chapters: audiobookshelfSession.chapters?.map(Chapter.init) ?? []
+      )
+      try? newItem.save()
+      updatedItem = newItem
+      AppLogger.session.debug("Created new episode from session")
+    } else {
+      switch audiobookshelfSession.libraryItem {
+      case .book(let book):
+        let newItem = LocalBook(from: book)
+        try? newItem.save()
+        updatedItem = (try? LocalBook.fetch(bookID: newItem.bookID)) ?? newItem
+      case .podcast:
+        throw SessionError.failedToCreateSession
+      }
+      AppLogger.session.debug("Created new item from session")
+    }
+
+    if audiobookshelfSession.currentTime > mediaProgress.currentTime {
+      AppLogger.session.info(
+        "Using server currentTime for cross-device sync: \(audiobookshelfSession.currentTime)s (local was: \(mediaProgress.currentTime)s)"
+      )
+      mediaProgress.currentTime = audiobookshelfSession.currentTime
+    }
+
+    let playbackSession = PlaybackSession(
+      id: session.id,
+      libraryItemID: itemID,
+      episodeID: episodeID,
+      startTime: mediaProgress.currentTime,
+      currentTime: mediaProgress.currentTime,
+      duration: updatedItem.duration,
+      baseURL: session.url,
+      displayTitle: updatedItem.title,
+      displayAuthor: updatedItem.details
+    )
+    playbackSession.tracks =
+      audiobookshelfSession.audioTracks?.map(Track.init) ?? updatedItem.orderedTracks
+    try playbackSession.save()
+    current = playbackSession
+
+    UserDefaults.standard.set(0, forKey: retryCountKey)
+    scheduleSessionClose()
+
+    AppLogger.session.info("Session setup completed successfully")
+    return (session, updatedItem)
+  }
+
+  private func refreshProgress(itemID: String, episodeID: String? = nil) {
+    Task {
+      do {
+        let progressID = episodeID.map { "\(itemID)/\($0)" } ?? itemID
+        let apiProgress = try await audiobookshelf.progress.fetch(bookID: progressID)
+        guard let mediaProgress = try MediaProgress.fetch(bookID: episodeID ?? itemID) else { return }
+        mediaProgress.update(from: apiProgress)
+        try mediaProgress.save()
+      } catch {
+        AppLogger.session.debug("Failed to refresh progress: \(error)")
+      }
+    }
+  }
+
+  private func startLocalSession(
+    libraryItemID: String,
+    episodeID: String? = nil,
+    item: any PlayableItem,
+    mediaProgress: MediaProgress
+  ) {
+    let session = PlaybackSession(
+      libraryItemID: libraryItemID,
+      episodeID: episodeID,
+      startTime: mediaProgress.currentTime,
+      currentTime: mediaProgress.currentTime,
+      duration: item.duration,
+      displayTitle: item.title,
+      displayAuthor: item.details
+    )
+    session.tracks = item.orderedTracks
+    try? session.save()
+    current = session
+    AppLogger.session.info("Started local session: \(session.id)")
+  }
+
+  func closeSession(
+    isDownloaded: Bool = false
+  ) async throws {
+    guard let session = current else {
+      AppLogger.session.debug("Session already closed or no session to close")
+      return
+    }
+
+    try session.save()
+
+    if session.isRemote {
+      if session.pendingListeningTime > 0 {
+        let timeListening = session.pendingListeningTime
+        do {
+          try await audiobookshelf.sessions.sync(
+            session.id,
+            timeListened: timeListening,
+            currentTime: session.currentTime
+          )
+          session.timeListening += timeListening
+          session.pendingListeningTime -= timeListening
+          try session.save()
+          AppLogger.session.debug("Synced final progress before closing remote session")
+        } catch {
+          AppLogger.session.error(
+            "Failed to sync session progress before close: \(error)"
+          )
+        }
+      }
+
+      do {
+        try await audiobookshelf.sessions.close(session.id)
+        AppLogger.session.info(
+          "Successfully closed remote session: \(session.id)"
+        )
+        UserDefaults.standard.removeObject(forKey: sessionIDKey)
+        UserDefaults.standard.removeObject(forKey: retryCountKey)
+        cancelScheduledSessionClose()
+      } catch {
+        AppLogger.session.error("Failed to close remote session: \(error)")
+
+        if isDownloaded {
+          AppLogger.session.info(
+            "Book is downloaded, clearing session to allow local session creation"
+          )
+          current = nil
+          UserDefaults.standard.removeObject(forKey: sessionIDKey)
+          UserDefaults.standard.removeObject(forKey: retryCountKey)
+          cancelScheduledSessionClose()
+          return
+        }
+
+        let retryCount = UserDefaults.standard.integer(forKey: retryCountKey)
+        guard let backoffDelay = calculateBackoffDelay(retryCount: retryCount) else {
+          AppLogger.session.warning(
+            "Maximum retry attempts reached. Giving up on closing session \(session.id). Session will auto-expire on server after 24h."
+          )
+          current = nil
+          UserDefaults.standard.removeObject(forKey: sessionIDKey)
+          UserDefaults.standard.removeObject(forKey: retryCountKey)
+          cancelScheduledSessionClose()
+          return
+        }
+
+        let newRetryCount = retryCount + 1
+        UserDefaults.standard.set(newRetryCount, forKey: retryCountKey)
+
+        AppLogger.session.info(
+          "Rescheduling session close with backoff delay: \(backoffDelay)s (retry: \(newRetryCount))"
+        )
+
+        scheduleSessionClose(customDelay: backoffDelay)
+        throw error
+      }
+      current = nil
+    } else {
+      current = nil
+
+      do {
+        let sessionSync = SessionSync(session)
+        try await audiobookshelf.sessions.syncLocalSession(sessionSync)
+        session.timeListening += session.pendingListeningTime
+        session.pendingListeningTime = 0
+        try session.save()
+        AppLogger.session.info(
+          "Successfully closed and synced local session: \(session.id)"
+        )
+      } catch {
+        try session.save()
+        AppLogger.session.error(
+          "Failed to sync local session: \(error). Session will be synced on next app startup."
+        )
+      }
+    }
+  }
+}
+
+extension SessionManager {
+  func syncProgress(currentTime: TimeInterval) async throws {
+    guard let session = current else {
+      throw SessionError.noActiveSession
+    }
+
+    let now = Date.now
+    let endOfSessionDay =
+      Calendar.current.date(bySettingHour: 23, minute: 59, second: 59, of: session.updatedAt) ?? now
+
+    session.currentTime = currentTime
+    session.updatedAt = min(now, endOfSessionDay)
+    try session.save()
+
+    guard session.pendingListeningTime >= 20, now.timeIntervalSince(lastSyncAt) >= 10 else {
+      return
+    }
+
+    lastSyncAt = now
+
+    if session.isRemote {
+      try await syncRemoteSession(session)
+    } else {
+      await syncLocalSession(session)
+    }
+  }
+
+  private func syncRemoteSession(_ session: PlaybackSession) async throws {
+    let timeListening = session.pendingListeningTime
+    do {
+      try await audiobookshelf.sessions.sync(
+        session.id,
+        timeListened: timeListening,
+        currentTime: session.currentTime
+      )
+      session.timeListening += timeListening
+      session.pendingListeningTime -= timeListening
+      try session.save()
+      scheduleSessionClose()
+      AppLogger.session.info("Successfully synced remote session: \(session.id)")
+    } catch {
+      AppLogger.session.error("Failed to sync remote session: \(error)")
+      throw error
+    }
+  }
+
+  private func syncLocalSession(_ session: PlaybackSession) async {
+    do {
+      try await audiobookshelf.sessions.syncLocalSession(SessionSync(session))
+      session.timeListening += session.pendingListeningTime
+      session.pendingListeningTime = 0
+      try session.save()
+      AppLogger.session.info("Successfully synced local session: \(session.id)")
+    } catch {
+      lastSyncAt = Date().advanced(by: min(session.pendingListeningTime * 2, 600))
+      AppLogger.session.error("Failed to sync local session: \(error)")
+    }
+
+    if !Calendar.current.isDate(session.startedAt, inSameDayAs: .now) {
+      let newSession = PlaybackSession(
+        libraryItemID: session.libraryItemID,
+        episodeID: session.episodeID,
+        startTime: session.currentTime,
+        currentTime: session.currentTime,
+        duration: session.duration,
+        displayTitle: session.displayTitle,
+        displayAuthor: session.displayAuthor
+      )
+      newSession.tracks = session.tracks
+      try? newSession.save()
+      current = newSession
+      AppLogger.session.info("Day changed, started new local session: \(newSession.id)")
+    }
+  }
+
+  func syncUnsyncedSessions() {
+    guard unsyncedSyncTask == nil else {
+      AppLogger.session.debug("Unsynced session sync already in progress")
+      return
+    }
+
+    if Date.now.timeIntervalSince(lastUnsyncedSyncAt) < unsyncedSyncDelay {
+      AppLogger.session.debug(
+        "Skipping unsynced session sync, next attempt allowed after \(self.unsyncedSyncDelay)s"
+      )
+      return
+    }
+
+    let unsyncedSessions: [PlaybackSession]
+    do {
+      unsyncedSessions = try PlaybackSession.fetchUnsynced()
+    } catch {
+      AppLogger.session.error("Failed to fetch unsynced sessions: \(error)")
+      return
+    }
+
+    guard !unsyncedSessions.isEmpty else {
+      AppLogger.session.debug("No unsynced sessions to sync")
+      return
+    }
+
+    AppLogger.session.info("Syncing \(unsyncedSessions.count) unsynced sessions")
+
+    lastUnsyncedSyncAt = .now
+    unsyncedSyncTask = Task {
+      defer { unsyncedSyncTask = nil }
+
+      var syncedCount = 0
+      for session in unsyncedSessions {
+        do {
+          try await audiobookshelf.sessions.syncLocalSession(SessionSync(session))
+          session.timeListening += session.pendingListeningTime
+          session.pendingListeningTime = 0
+          try session.save()
+          syncedCount += 1
+        } catch {
+          if let networkError = error as? NetworkError,
+            case .httpError(let statusCode, _) = networkError,
+            !([401, 408, 429].contains(statusCode) || statusCode >= 500)
+          {
+            AppLogger.session.warning(
+              "Server rejected session \(session.id) with HTTP \(statusCode), skipping it"
+            )
+            continue
+          }
+
+          unsyncedSyncDelay = max(60, min(unsyncedSyncDelay * 2, 16 * 60))
+          AppLogger.session.error(
+            "Failed to sync session \(session.id) after \(syncedCount) synced: \(error). Next attempt in \(self.unsyncedSyncDelay)s."
+          )
+          return
+        }
+      }
+
+      unsyncedSyncDelay = 30
+      AppLogger.session.info("Successfully synced \(syncedCount) sessions")
+    }
+  }
+}
+
+extension SessionManager {
+  private func registerBackgroundTask() {
+    let success = BGTaskScheduler.shared.register(
+      forTaskWithIdentifier: taskIdentifier,
+      using: nil
+    ) { [weak self] task in
+      AppLogger.session.debug("Task triggered")
+      guard let refreshTask = task as? BGAppRefreshTask else {
+        task.setTaskCompleted(success: false)
+        return
+      }
+      self?.handleBackgroundTask(refreshTask)
+    }
+
+    if success {
+      AppLogger.session.info(
+        "Background task handler registered successfully for: \(self.taskIdentifier)"
+      )
+    } else {
+      AppLogger.session.warning(
+        "Failed to register background task handler for: \(self.taskIdentifier)"
+      )
+      AppLogger.session.debug(
+        "Note: This is normal if registration was already done, or if running in certain environments"
+      )
+    }
+  }
+
+  private func scheduleSessionClose(customDelay: TimeInterval? = nil) {
+    guard let sessionID = current?.id else {
+      AppLogger.session.warning("Cannot schedule session close - no active session")
+      return
+    }
+
+    UserDefaults.standard.set(sessionID, forKey: sessionIDKey)
+
+    let delay = customDelay ?? inactivityTimeout
+    let request = BGAppRefreshTaskRequest(identifier: taskIdentifier)
+    request.earliestBeginDate = Date(timeIntervalSinceNow: delay)
+
+    do {
+      try BGTaskScheduler.shared.submit(request)
+      AppLogger.session.info(
+        "Scheduled background task to close session \(sessionID) after \(delay)s"
+      )
+    } catch let error as NSError {
+      if error.code == 1 {
+        AppLogger.session.warning(
+          "Background tasks unavailable (Background App Refresh may be disabled). Session will close on foreground instead."
+        )
+      } else {
+        AppLogger.session.error("Failed to schedule background task: \(error)")
+      }
+    }
+  }
+
+  private func cancelScheduledSessionClose() {
+    BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: taskIdentifier)
+    UserDefaults.standard.removeObject(forKey: sessionIDKey)
+    AppLogger.session.debug("Canceled scheduled session close background task")
+  }
+
+  private func handleBackgroundTask(_ task: BGAppRefreshTask) {
+    task.expirationHandler = {
+      task.setTaskCompleted(success: false)
+    }
+
+    let retryCount = UserDefaults.standard.integer(forKey: retryCountKey)
+    AppLogger.session.info(
+      "Background task executing - checking if session should be closed (retry: \(retryCount))"
+    )
+
+    let nowPlayingInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo
+    let playbackRate = nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double ?? 0.0
+    let carPlayConnected = AVAudioSession.sharedInstance().isCarPlayConnected
+
+    if playbackRate > 0 {
+      AppLogger.session.info("Playback is still active, rescheduling session close")
+      UserDefaults.standard.set(0, forKey: retryCountKey)
+      scheduleSessionClose()
+      task.setTaskCompleted(success: false)
+    } else if carPlayConnected {
+      AppLogger.session.info("CarPlay is connected, rescheduling session close")
+      UserDefaults.standard.set(0, forKey: retryCountKey)
+      scheduleSessionClose()
+      task.setTaskCompleted(success: false)
+    } else {
+      AppLogger.session.info("Playback is not active, attempting to close session")
+      Task {
+        await endAllSleepTimerLiveActivities()
+        do {
+          try await closeSession()
+          task.setTaskCompleted(success: true)
+        } catch {
+          task.setTaskCompleted(success: false)
+        }
+      }
+    }
+  }
+
+  private func calculateBackoffDelay(retryCount: Int) -> TimeInterval? {
+    let backoffSchedule: [TimeInterval] = [
+      10 * 60,
+      30 * 60,
+      60 * 60,
+      2 * 60 * 60,
+      4 * 60 * 60,
+      4 * 60 * 60,
+      4 * 60 * 60,
+      4 * 60 * 60,
+    ]
+
+    guard retryCount < backoffSchedule.count else { return nil }
+
+    return backoffSchedule[retryCount]
+  }
+}
+
+extension SessionManager {
+  func notifyPlaybackStopped() {
+    AppLogger.session.debug("Playback stopped - starting inactivity countdown")
+    startInactivityTask()
+  }
+
+  func notifyPlaybackStarted() {
+    AppLogger.session.debug("Playback started - canceling inactivity countdown")
+    cancelInactivityTask()
+  }
+
+  private func startInactivityTask() {
+    cancelInactivityTask()
+
+    inactivityTask = Task {
+      do {
+        try await Task.sleep(for: .seconds(inactivityTimeout))
+
+        guard !Task.isCancelled else {
+          AppLogger.session.debug("Inactivity task was cancelled")
+          return
+        }
+
+        let nowPlayingInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo
+        let playbackRate = nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double ?? 0.0
+        let carPlayConnected = AVAudioSession.sharedInstance().isCarPlayConnected
+
+        if playbackRate > 0 {
+          AppLogger.session.info(
+            "Inactivity timeout reached but playback is active - not closing session"
+          )
+          return
+        }
+
+        if carPlayConnected {
+          AppLogger.session.info(
+            "Inactivity timeout reached but CarPlay is connected - not closing session"
+          )
+          return
+        }
+
+        AppLogger.session.info("Inactivity timeout reached - closing session")
+        inactivityTask = nil
+        try? await closeSession()
+      } catch {
+        AppLogger.session.debug("Inactivity task sleep was interrupted: \(error)")
+      }
+    }
+  }
+
+  private func cancelInactivityTask() {
+    inactivityTask?.cancel()
+    inactivityTask = nil
+  }
+}
+
+extension SessionManager {
+  #if !targetEnvironment(macCatalyst)
+  private func endAllSleepTimerLiveActivities() async {
+    for activity in Activity<SleepTimerActivityAttributes>.activities {
+      await activity.end(nil, dismissalPolicy: .immediate)
+    }
+    AppLogger.session.info("Ended all sleep timer Live Activities during session cleanup")
+  }
+  #else
+  private func endAllSleepTimerLiveActivities() async {}
+  #endif
+}
+
+extension SessionSync {
+  init(_ session: PlaybackSession) {
+    self.init(
+      id: session.id,
+      libraryItemId: session.libraryItemID,
+      episodeId: session.episodeID,
+      mediaType: session.episodeID != nil ? "podcast" : "book",
+      duration: session.duration,
+      startTime: session.startTime,
+      currentTime: session.currentTime,
+      timeListening: session.timeListening + session.pendingListeningTime,
+      startedAt: Int(session.startedAt.timeIntervalSince1970 * 1000),
+      updatedAt: Int(session.updatedAt.timeIntervalSince1970 * 1000),
+      deviceInfo: SessionSync.DeviceInfo(
+        deviceID: SessionService.deviceID,
+        clientName: "AudioBook Karaoke iOS",
+        model: Device.model
+      )
+    )
+  }
+}

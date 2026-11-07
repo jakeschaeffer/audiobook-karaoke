@@ -1,0 +1,107 @@
+import API
+import Combine
+import Foundation
+import Models
+
+final class PodcastCardModel: BookCard.Model {
+  private var progressObservation: Task<Void, Never>?
+  private var downloadStateCancellable: AnyCancellable?
+
+  init(_ podcast: Podcast, sortBy: SortBy?) {
+    let id = podcast.recentEpisode?.id ?? podcast.id
+
+    let title = podcast.recentEpisode?.title ?? podcast.title
+    let author = podcast.author
+
+    let details: String?
+    let time: Date.FormatStyle.TimeStyle
+    if UserPreferences.shared.libraryDisplayMode == .row {
+      time = .shortened
+    } else {
+      time = .omitted
+    }
+
+    switch sortBy {
+    case .title, .author, .random, .numEpisodes:
+      details = "\(podcast.numEpisodes) Episodes"
+    case .addedAt:
+      details = "Added \(podcast.addedAt.formatted(date: .numeric, time: time))"
+    case .size:
+      details = podcast.size.map {
+        "Size \($0.formatted(.byteCount(style: .file)))"
+      }
+    case .birthtime, .modified:
+      details = "\(podcast.numEpisodes) Episodes"
+    default:
+      details = nil
+    }
+
+    let progress = MediaProgress.progress(for: id)
+
+    let cover = Cover.Model(
+      url: podcast.coverURL(),
+      title: title,
+      author: author,
+      progress: progress
+    )
+
+    let episodeContextMenu = podcast.recentEpisode.map { episode in
+      PodcastEpisodeContextMenuModel(
+        episodeID: episode.id,
+        podcastID: podcast.id,
+        podcastTitle: podcast.title,
+        podcastAuthor: podcast.author,
+        coverURL: podcast.coverURL(raw: true),
+        episodeTitle: episode.title,
+        episodeDuration: episode.duration,
+        episodeSize: episode.audioTrack?.metadata?.size ?? episode.size,
+        isCompleted: progress >= 1.0,
+        progress: progress,
+        apiEpisode: episode
+      )
+    }
+
+    super.init(
+      id: id,
+      podcastID: podcast.id,
+      title: title,
+      details: details,
+      cover: cover,
+      author: author,
+      episodeContextMenu: episodeContextMenu
+    )
+
+    setupDownloadStateObserver()
+
+    if sortBy == nil {
+      observeMediaProgress()
+    }
+  }
+
+  isolated deinit {
+    progressObservation?.cancel()
+  }
+
+  private func setupDownloadStateObserver() {
+    let episodeID = id
+    downloadStateCancellable = DownloadManager.shared.$downloadStates
+      .sink { [weak self] states in
+        guard let self else { return }
+        if case .downloading(let progress) = states[episodeID] {
+          self.cover.downloadProgress = progress
+        } else {
+          self.cover.downloadProgress = nil
+        }
+        self.isDownloaded = states[episodeID] == .downloaded
+      }
+  }
+
+  private func observeMediaProgress() {
+    let episodeID = id
+    progressObservation = Task { [weak self] in
+      for await _ in MediaProgress.observe(where: \.bookID, equals: episodeID) {
+        self?.cover.progress = MediaProgress.progress(for: episodeID)
+      }
+    }
+  }
+}

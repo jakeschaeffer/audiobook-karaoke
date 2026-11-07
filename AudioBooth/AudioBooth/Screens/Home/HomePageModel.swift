@@ -1,0 +1,574 @@
+import API
+import Combine
+import Logging
+import Models
+import SwiftData
+import SwiftUI
+import WidgetKit
+
+final class HomePageModel: HomePage.Model {
+  private let downloadManager = DownloadManager.shared
+  private let playerManager = PlayerManager.shared
+  private let preferences = UserPreferences.shared
+  private let pinnedPlaylistManager = PinnedPlaylistManager.shared
+
+  private var cancellables = Set<AnyCancellable>()
+
+  private var continueListeningBooks: [Book] = []
+  private var continueListeningEpisodes: [Podcast] = []
+  private var personalizedSections: [Personalized.Section] = []
+  private var pinnedPlaylist: Playlist?
+  private var fetchingLibraryID: String?
+  private var discoverBooks: [Book] = []
+
+  private var continueListening: ContinueListeningCoverFlowView.Model?
+  private var continueReading: ContinueListeningCoverFlowView.Model?
+  private var continueListeningEpisodeCards: [EpisodeCard.Model] = []
+
+  init() {
+    super.init()
+    loadCachedContent()
+
+    Audiobookshelf.shared.libraries.objectWillChange
+      .receive(on: RunLoop.main)
+      .sink { [weak self] _ in
+        self?.availableLibraries = Audiobookshelf.shared.libraries.libraries.map {
+          LibraryItem(id: $0.id, name: $0.name)
+        }
+      }
+      .store(in: &cancellables)
+
+    NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)
+      .sink { [weak self] _ in
+        Task {
+          await self?.fetchRemoteContent()
+        }
+      }
+      .store(in: &cancellables)
+
+    pinnedPlaylistManager.objectWillChange
+      .sink { [weak self] _ in
+        Task {
+          await self?.fetchPinnedPlaylist()
+          self?.rebuildSections()
+        }
+      }
+      .store(in: &cancellables)
+  }
+
+  override func onAppear() {
+    Task {
+      await fetchRemoteContent()
+    }
+
+    downloadManager.updateDownloadStates()
+  }
+
+  override func refresh() async {
+    if Audiobookshelf.shared.libraries.current != nil {
+      _ = try? await Audiobookshelf.shared.filterData.fetch()
+    }
+    discoverBooks = []
+    await fetchRemoteContent()
+  }
+
+  override func onReset(_ shouldRefresh: Bool) {
+    continueListeningBooks = []
+    continueListeningEpisodes = []
+    personalizedSections = []
+    pinnedPlaylist = nil
+    discoverBooks = []
+    continueListening = nil
+    continueReading = nil
+    continueListeningEpisodeCards = []
+    sections = []
+    isLoading = false
+
+    if shouldRefresh {
+      loadCachedContent()
+      onAppear()
+    }
+  }
+
+  override func onLibrarySelected(_ id: String) {
+    guard let library = Audiobookshelf.shared.libraries.libraries.first(where: { $0.id == id }) else { return }
+    Audiobookshelf.shared.libraries.current = library
+  }
+
+  override func onToggleAlternativeURL() {
+    guard let server = Audiobookshelf.shared.authentication.server else { return }
+    Audiobookshelf.shared.authentication.setUsingAlternativeURL(
+      server.id,
+      isUsing: !server.isUsingAlternativeURL
+    )
+  }
+
+  override func onPreferencesChanged() {
+    rebuildSections()
+    if let current = dailyGoal?.current {
+      dailyGoal = (current: current, goal: preferences.dailyGoalMinutes)
+    }
+  }
+}
+
+extension HomePageModel {
+  private func fetchPinnedPlaylist() async {
+    do {
+      pinnedPlaylist = try await pinnedPlaylistManager.fetch()
+    } catch {
+      AppLogger.viewModel.error("Failed to fetch pinned playlist: \(error)")
+    }
+  }
+}
+
+extension HomePageModel {
+  private func processSections(_ personalized: [Personalized.Section]) {
+    personalizedSections = personalized
+    continueListeningBooks = []
+    continueListeningEpisodes = []
+
+    for section in personalized {
+      if section.id == "continue-listening" {
+        if case .books(let items) = section.entities {
+          continueListeningBooks = items
+          WatchConnectivityManager.shared.syncContinueListening(books: items)
+        } else if case .episodes(let items) = section.entities {
+          continueListeningEpisodes = items
+        }
+        break
+      }
+    }
+
+    rebuildSections()
+  }
+
+  private func rebuildSections() {
+    guard Audiobookshelf.shared.libraries.current != nil else {
+      self.sections = []
+      return
+    }
+
+    let enabledSections = Set(preferences.homeSections.map(\.rawValue))
+
+    var sectionsByID: [String: Section] = [:]
+
+    for section in personalizedSections {
+      guard enabledSections.contains(section.id) else { continue }
+
+      let title = HomeSection(rawValue: section.id)?.displayName ?? section.label
+
+      switch section.entities {
+      case .books(let items):
+        if section.id == "continue-listening" || section.id == "continue-reading" {
+          continue
+        } else if section.id == "continue-series" {
+          let books = items.map({ BookCardModel($0, sortBy: .title, options: .showSequence) })
+          sectionsByID[section.id] = .init(
+            id: section.id,
+            title: title,
+            items: .books(books)
+          )
+        } else if section.id == "discover" {
+          if discoverBooks.isEmpty {
+            discoverBooks = items
+          }
+          let books = discoverBooks.map({ BookCardModel($0, sortBy: .title) })
+          sectionsByID[section.id] = .init(
+            id: section.id,
+            title: title,
+            items: .books(books)
+          )
+        } else {
+          let books = items.map({ BookCardModel($0, sortBy: .title) })
+          sectionsByID[section.id] = .init(
+            id: section.id,
+            title: title,
+            items: .books(books)
+          )
+        }
+
+      case .series(let items):
+        let series = items.map { SeriesCardModel(series: $0) }
+        sectionsByID[section.id] = .init(
+          id: section.id,
+          title: title,
+          items: .series(series)
+        )
+
+      case .authors(let items):
+        let authors = items.map { AuthorCardModel(author: $0) }
+        sectionsByID[section.id] = .init(
+          id: section.id,
+          title: title,
+          items: .authors(authors)
+        )
+
+      case .podcasts(let items):
+        let podcasts = items.map { PodcastCardModel($0, sortBy: nil) }
+        sectionsByID[section.id] = .init(
+          id: section.id,
+          title: title,
+          items: .books(podcasts)
+        )
+
+      case .episodes(let items):
+        guard section.id != "continue-listening" else { continue }
+        let episodes = items.compactMap { podcast in
+          podcast.recentEpisode.map { EpisodeCardModel(podcast: podcast, episode: $0) }
+        }
+        guard !episodes.isEmpty else { continue }
+        sectionsByID[section.id] = .init(
+          id: section.id,
+          title: title,
+          items: .episodes(episodes)
+        )
+
+      case .unknown:
+        continue
+      }
+    }
+
+    let isPodcastLibrary = Audiobookshelf.shared.libraries.current?.mediaType == .podcast
+    let continueListeningSection =
+      isPodcastLibrary
+      ? buildEpisodesContinueListeningSection() ?? buildBooksContinueListeningSection()
+      : buildBooksContinueListeningSection() ?? buildEpisodesContinueListeningSection()
+    let continueReadingSection = buildContinueReadingSection()
+    let pinnedPlaylistSection = buildPinnedPlaylistSection()
+
+    var orderedSections: [Section] = []
+
+    for sectionID in preferences.homeSections {
+      switch sectionID {
+      case .listeningStats:
+        orderedSections.append(Section(id: "listening-stats", title: "", items: .stats))
+
+      case .pinnedPlaylist:
+        if let pinnedPlaylistSection {
+          orderedSections.append(pinnedPlaylistSection)
+        }
+
+      case .continueListening:
+        if let continueListeningSection {
+          orderedSections.append(continueListeningSection)
+        }
+
+      case .continueReading:
+        if let continueReadingSection {
+          orderedSections.append(continueReadingSection)
+        }
+
+      default:
+        if let section = sectionsByID[sectionID.rawValue] {
+          orderedSections.append(section)
+        }
+      }
+    }
+
+    self.sections = orderedSections
+
+    WatchConnectivityManager.shared.syncContinueListening(
+      books: continueListeningBooks,
+      episodes: continueListeningEpisodes
+    )
+    WatchConnectivityManager.shared.syncHomeSections(
+      sections: personalizedSections,
+      enabledSections: preferences.homeSections
+    )
+    saveRecentBooksToWidget()
+  }
+
+  private func buildBooksContinueListeningSection() -> Section? {
+    let existingModels: [String: ContinueListeningBookCardModel]
+    if let continueListening {
+      existingModels = Dictionary(
+        continueListening.items.compactMap { item in
+          guard let cardModel = item as? ContinueListeningBookCardModel else { return nil }
+          return (cardModel.id, cardModel)
+        },
+        uniquingKeysWith: { first, _ in first }
+      )
+    } else {
+      existingModels = [:]
+    }
+
+    let booksToDisplay = continueListeningBooks.filter { book in
+      MediaProgress.progress(for: book.id) < 1.0
+    }
+
+    var models: [ContinueListeningBookCardModel] = []
+
+    if let currentPlayerID = playerManager.current?.id,
+      !booksToDisplay.contains(where: { $0.id == currentPlayerID }),
+      let currentLocalBook = try? LocalBook.fetch(bookID: currentPlayerID),
+      !currentLocalBook.hasImportedNarration
+    {
+      if let existingModel = existingModels[currentPlayerID] {
+        models.append(existingModel)
+      } else {
+        let model = ContinueListeningBookCardModel(
+          localBook: currentLocalBook,
+          onRemoved: { [weak self] in
+            guard let self else { return }
+            self.continueListeningBooks = self.continueListeningBooks.filter({ $0.id != currentPlayerID })
+            self.rebuildSections()
+          }
+        )
+        models.append(model)
+      }
+    }
+
+    for book in booksToDisplay {
+      let model: ContinueListeningBookCardModel
+
+      if let existingModel = existingModels[book.id] {
+        model = existingModel
+      } else {
+        model = ContinueListeningBookCardModel(
+          book: book,
+          onRemoved: { [weak self] in
+            guard let self else { return }
+            self.continueListeningBooks = self.continueListeningBooks.filter({ $0.id != book.id })
+            self.rebuildSections()
+          }
+        )
+      }
+
+      models.append(model)
+    }
+
+    let sorted = models.sorted(by: <)
+
+    guard !sorted.isEmpty else { return nil }
+
+    let model = continueListening ?? .init(items: sorted)
+    model.items = sorted
+    continueListening = model
+
+    return Section(
+      id: "continue-listening",
+      title: String(localized: "Continue Listening"),
+      items: .continueBooks(model)
+    )
+  }
+
+  private func buildContinueReadingSection() -> Section? {
+    var books: [BookCard.Model] = []
+
+    if let section = personalizedSections.first(where: { $0.id == "continue-reading" }),
+      case .books(let items) = section.entities
+    {
+      books = items.map({ BookCardModel($0, sortBy: .title) })
+    }
+
+    if let currentPlayerID = playerManager.current?.id,
+      !books.contains(where: { $0.id == currentPlayerID }),
+      let currentLocalBook = try? LocalBook.fetch(bookID: currentPlayerID),
+      currentLocalBook.hasImportedNarration
+    {
+      books.insert(BookCardModel(currentLocalBook), at: 0)
+    }
+
+    guard !books.isEmpty else { return nil }
+
+    let model = continueReading ?? .init(items: books)
+    model.items = books
+    continueReading = model
+
+    return Section(
+      id: "continue-reading",
+      title: HomeSection.continueReading.displayName,
+      items: .continueBooks(model)
+    )
+  }
+
+  private func buildEpisodesContinueListeningSection() -> Section? {
+    let existingModels = Dictionary(
+      continueListeningEpisodeCards.map { ($0.id, $0) },
+      uniquingKeysWith: { first, _ in first }
+    )
+
+    var models: [EpisodeCard.Model] = []
+
+    if let currentPlayerID = playerManager.current?.id,
+      !continueListeningEpisodes.contains(where: { $0.recentEpisode?.id == currentPlayerID })
+    {
+      if let existingModel = existingModels[currentPlayerID] {
+        models.append(existingModel)
+      } else if let episode = try? LocalEpisode.fetch(episodeID: currentPlayerID),
+        let model = EpisodeCardModel(localEpisode: episode)
+      {
+        models.append(model)
+      }
+    }
+
+    for podcast in continueListeningEpisodes {
+      guard let episode = podcast.recentEpisode, MediaProgress.progress(for: episode.id) < 1.0 else { continue }
+      models.append(existingModels[episode.id] ?? EpisodeCardModel(podcast: podcast, episode: episode))
+    }
+
+    continueListeningEpisodeCards = models
+
+    guard !models.isEmpty else { return nil }
+
+    return Section(
+      id: "continue-listening",
+      title: String(localized: "Continue Listening"),
+      items: .episodes(models)
+    )
+  }
+
+  private func buildPinnedPlaylistSection() -> Section? {
+    guard let playlist = pinnedPlaylist else { return nil }
+    guard !playlist.items.isEmpty else { return nil }
+
+    let models: [Section.PlaylistItem] = playlist.items.map { item in
+      switch item.libraryItem {
+      case .book(let book):
+        return .book(BookCardModel(book, sortBy: .title))
+      case .podcast(let podcast):
+        if let episode = item.episode {
+          return .episode(EpisodeCardModel(podcast: podcast, episode: episode))
+        } else {
+          return .book(
+            BookCard.Model(
+              id: podcast.id,
+              title: podcast.title,
+              cover: Cover.Model(url: podcast.coverURL(raw: true)),
+              author: podcast.author
+            )
+          )
+        }
+      }
+    }
+
+    return Section(
+      id: "pinned-playlist",
+      title: playlist.name,
+      items: .playlist(id: playlist.id, items: models)
+    )
+  }
+}
+
+extension HomePageModel {
+  private func loadCachedContent() {
+    availableLibraries = Audiobookshelf.shared.libraries.libraries.map { LibraryItem(id: $0.id, name: $0.name) }
+
+    guard Audiobookshelf.shared.libraries.current != nil else { return }
+
+    if let cachedPlaylist = pinnedPlaylistManager.loadCached() {
+      pinnedPlaylist = cachedPlaylist
+    }
+
+    guard let personalized = Audiobookshelf.shared.libraries.getCachedPersonalized() else {
+      return
+    }
+
+    processSections(personalized.sections)
+  }
+
+  private func fetchRemoteContent() async {
+    guard let libraryID = Audiobookshelf.shared.libraries.current?.id, fetchingLibraryID != libraryID else { return }
+
+    fetchingLibraryID = libraryID
+
+    defer {
+      if fetchingLibraryID == libraryID {
+        fetchingLibraryID = nil
+        isLoading = false
+      }
+    }
+
+    if sections.isEmpty {
+      isLoading = true
+    }
+
+    do {
+      let data = try await Audiobookshelf.shared.authentication.authorize()
+      try? MediaProgress.syncFromAPI(
+        userData: data.user,
+        currentPlayingBookID: PlayerManager.shared.current?.id
+      )
+      downloadManager.removeCompleted()
+      try? Bookmark.syncFromAPI(userData: data.user)
+
+      BookmarkSyncQueue.shared.syncPending()
+
+      let version = data.serverSettings.version
+      if version.compare("2.22.0", options: .numeric) == .orderedAscending {
+        error =
+          "Some features may be limited on server version \(version). For the best experience, please update your server."
+      }
+
+      async let pinnedPlaylistFetch: Void = fetchPinnedPlaylist()
+      let personalized = try await Audiobookshelf.shared.libraries.fetchPersonalized()
+      guard personalized.libraryID == Audiobookshelf.shared.libraries.current?.id else { return }
+      await pinnedPlaylistFetch
+
+      processSections(personalized.sections)
+    } catch {
+      AppLogger.viewModel.error("Failed to fetch personalized content: \(error)")
+    }
+
+    Task {
+      if let stats = try? await Audiobookshelf.shared.authentication.fetchListeningStats() {
+        dailyGoal = (current: stats.today, goal: preferences.dailyGoalMinutes)
+      }
+    }
+  }
+}
+
+extension HomePageModel {
+  private func saveRecentBooksToWidget() {
+    struct BookEntry: Codable {
+      let bookID: String
+      let title: String
+      let author: String
+      let coverURL: URL?
+    }
+
+    let sharedDefaults = UserDefaults(suiteName: AppGroup.identifier)
+
+    do {
+      let allProgress = try MediaProgress.fetchAll()
+      let sortedProgress =
+        allProgress
+        .filter { !$0.isFinished }
+        .sorted { $0.lastUpdate > $1.lastUpdate }
+
+      let continueListeningByID = Dictionary(
+        continueListeningBooks.map { ($0.id, $0) },
+        uniquingKeysWith: { first, _ in first }
+      )
+
+      var books: [BookEntry] = []
+
+      for progress in sortedProgress {
+        guard books.count < 5 else { break }
+
+        if let localBook = try? LocalBook.fetch(bookID: progress.bookID) {
+          let book = BookEntry(
+            bookID: localBook.bookID,
+            title: localBook.title,
+            author: localBook.authorNames,
+            coverURL: localBook.coverURL
+          )
+          books.append(book)
+        } else if let remoteBook = continueListeningByID[progress.bookID] {
+          let book = BookEntry(
+            bookID: remoteBook.id,
+            title: remoteBook.title,
+            author: remoteBook.authorName ?? "",
+            coverURL: remoteBook.coverURL()
+          )
+          books.append(book)
+        }
+      }
+
+      let data = try JSONEncoder().encode(books)
+      sharedDefaults?.set(data, forKey: "recentBooks")
+      WidgetCenter.shared.reloadAllTimelines()
+    } catch {
+    }
+  }
+}
